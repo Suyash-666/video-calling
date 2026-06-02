@@ -35,6 +35,7 @@ peer-to-peer; Supabase is not in the media path.
 zoom-mini/
 ├── README.md
 ├── .gitignore
+├── vercel.json            # Vercel build config (root dir, SPA rewrite, asset cache)
 ├── supabase/
 │   └── migrations/
 │       ├── 0001_realtime_auth_and_rooms.sql
@@ -192,16 +193,79 @@ a slide-in chat panel. The panel:
 ## 3. Deploy to Vercel
 
 The whole thing is a static Vite app — no server, no functions, no
-Edge Functions, no environment-specific build steps.
+Edge Functions, no environment-specific build steps. The repo
+includes a `vercel.json` at the root with the build settings and
+an SPA rewrite, so you can deploy with one click.
 
-1. Push the `client/` directory to a Git repo.
-2. On Vercel → **Add New → Project** → import the repo.
-3. Vercel auto-detects Vite. Build command: `npm run build`. Output: `dist`.
-4. Add env vars in the Vercel project settings:
-   - `VITE_SUPABASE_URL`
-   - `VITE_SUPABASE_ANON_KEY`
-5. Deploy. Open the Vercel URL in two tabs, click **Create Room** in
-   one and **Join Room** with the same id in the other. Done.
+### 3.1 One-time: push to GitHub
+
+```bash
+cd zoom-mini
+git init -b main             # only the first time
+git add -A
+git commit -m "Initial deploy"
+gh repo create zoom-mini --public --source=. --remote=origin --push
+# or: create the repo on github.com, then:
+#   git remote add origin git@github.com:<you>/zoom-mini.git
+#   git push -u origin main
+```
+
+### 3.2 Import into Vercel
+
+1. Go to [vercel.com/new](https://vercel.com/new).
+2. Import the `zoom-mini` repo.
+3. **Root Directory** → click **Edit** → set to `client`. This is
+   the most common gotcha: Vercel's auto-detection sees the
+   `package.json` at the repo root (`zoom-mini/package.json`) and
+   will fail to build unless you point it at `client/`.
+4. Framework Preset should auto-detect as **Vite**. If not, select it.
+5. **Environment Variables** — add both, picking values from
+   **Production**, **Preview**, and **Development** (toggle all
+   three on if you want to test on Preview URLs before promoting):
+   - `VITE_SUPABASE_URL` — `https://<project-ref>.supabase.co`
+   - `VITE_SUPABASE_ANON_KEY` — the `anon` `public` key from
+     **Project Settings → API**
+6. Click **Deploy**. The first build takes ~1 minute. When it's
+   done you'll get a URL like `https://zoom-mini-<hash>.vercel.app`.
+
+### 3.3 Smoke-test the deployed app
+
+1. Open the Vercel URL in **Tab 1**. Create an account, then
+   **Create Room**. Allow camera + mic. The green **HOST** badge
+   should appear in the header.
+2. In **Tab 2** (different browser, or incognito), open the same
+   URL. Sign up a different email. Check **I have an invite code**,
+   paste a token from Tab 1's 📨 Invite button, click **Join Room**.
+3. The remote video should appear in both tabs within ~1 second.
+4. Open the 💬 Chat tab in both tabs and exchange a message.
+5. Refresh Tab 2 — the chat history should still be there.
+
+### 3.4 Troubleshoot
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Blank page on the deployed URL | Vercel built the wrong directory | Project Settings → General → **Root Directory** = `client`, then redeploy |
+| `Supabase env vars are missing` amber warning on the deployed site | Env vars not set in Vercel (or names misspelled) | Project Settings → Environment Variables. Names must be **exactly** `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (the `VITE_` prefix is required for Vite to expose them). Redeploy after changing them. |
+| `CHANNEL_ERROR` on Join Room | Migrations not applied (or applied to wrong project) | Re-check the Supabase project the URL points to. Open SQL Editor → run the function-check query from section 2.3 above. |
+| Webcam works locally but not on the deployed URL | Browser blocked the camera because the Vercel preview URL isn't HTTPS | The default `*.vercel.app` URL is HTTPS so this shouldn't happen. If you're using a custom domain, make sure it's served over HTTPS — `getUserMedia` requires a secure context. |
+| Chat history empty after refresh | RLS denied the read | Verify all six migrations ran in order. The most common cause is `0003` (room_members) or `0005` (realtime per-channel auth) being missing. |
+| "Could not create invite: function public.create_invite(text, integer) does not exist" | `0006` didn't apply | Re-run `0006_invite_expiry_rpc.sql` in SQL Editor. |
+| Invite button does nothing | Click-outside effect closing the panel on open click | Already fixed in `App.tsx` — `inviteWrapperRef` + `mousedown` listener. Hard-refresh the deployed site (`Ctrl+Shift+R` / `Cmd+Shift+R`) to pick up the new build. |
+
+### 3.5 Environment variables reference
+
+The Vite client reads two env vars at **build time**. They become
+part of the JS bundle (the anon key is designed for this — it is
+gated by RLS on the server). If you change them, you must redeploy
+— Vite does not read `.env` at runtime in production.
+
+| Name | Where it comes from | Used by |
+|---|---|---|
+| `VITE_SUPABASE_URL` | Supabase Dashboard → Project Settings → API → **Project URL** | `lib/supabase.ts` |
+| `VITE_SUPABASE_ANON_KEY` | Supabase Dashboard → Project Settings → API → **anon public** key | `lib/supabase.ts` |
+
+Never put the `service_role` key in a `VITE_*` env var — that key
+bypasses RLS and would expose all your data to the world.
 
 ---
 
