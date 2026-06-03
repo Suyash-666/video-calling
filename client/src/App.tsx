@@ -18,6 +18,7 @@ import { ChatPanel } from './components/ChatPanel';
 import { ParticipantSidebar } from './components/ParticipantSidebar';
 import { WaitingScreen, WaitingRoomPanel } from './components/WaitingRoom';
 import { MAX_PARTICIPANTS } from './types';
+import { buildInviteLink } from './lib/inviteLink';
 
 export default function App() {
   const { user, loading } = useAuth();
@@ -53,6 +54,11 @@ export default function App() {
   const [participantsOpen, setParticipantsOpen] = useState(false);
   const [inviteFeedback, setInviteFeedback] = useState<string | null>(null);
   const [invitePanelOpen, setInvitePanelOpen] = useState(false);
+  // 'code' = copy the bare token; 'link' = copy a full URL that the
+  // guest can paste into the lobby's "Join via invite link" field or
+  // open directly to auto-join. Default to link — it's the friendlier
+  // share for most cases.
+  const [inviteMode, setInviteMode] = useState<'code' | 'link'>('link');
   // Custom-minutes input, in minutes. Empty string means "use a preset".
   const [inviteMinutes, setInviteMinutes] = useState<string>('');
   // Ref to the wrapper that contains BOTH the trigger button and the
@@ -67,16 +73,25 @@ export default function App() {
     { label: '24 hours', seconds: 24 * 60 * 60 },
   ];
 
-  // Issue an invite and copy the token to the clipboard. Falls back to
-  // displaying the token if the clipboard write is blocked.
-  const issueInvite = async (seconds: number) => {
+  // Issue an invite and copy either the bare token or a full
+  // shareable link to the clipboard, depending on `mode`. Falls back
+  // to displaying the value inline if the clipboard write is blocked.
+  const issueInvite = async (
+    seconds: number,
+    mode: 'code' | 'link' = 'code'
+  ) => {
     const token = await createInvite(seconds);
-    if (!token) return;
+    if (!token || !roomId) return;
+    const value = mode === 'link' ? buildInviteLink(roomId, token) : token;
     try {
-      await navigator.clipboard.writeText(token);
-      setInviteFeedback('Invite copied to clipboard');
+      await navigator.clipboard.writeText(value);
+      setInviteFeedback(
+        mode === 'link'
+          ? 'Invite link copied to clipboard'
+          : 'Invite code copied to clipboard'
+      );
     } catch {
-      setInviteFeedback(token);
+      setInviteFeedback(value);
     }
     setTimeout(() => setInviteFeedback(null), 6000);
     setInvitePanelOpen(false);
@@ -218,6 +233,36 @@ export default function App() {
                       className="absolute right-0 z-30 mt-2 w-80 rounded-lg border border-slate-700 bg-slate-900 p-3 shadow-xl"
                       onClick={(e) => e.stopPropagation()}
                     >
+                      {/* Pick whether the preset buttons copy a bare
+                          code or a full link. Default is link; code is
+                          kept for callers who type into the existing
+                          "I have an invite code" field. */}
+                      <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">
+                        Copy as
+                      </p>
+                      <div className="mb-2 flex gap-1 rounded-md bg-slate-800 p-0.5 text-[11px]">
+                        <button
+                          onClick={() => setInviteMode('link')}
+                          className={`flex-1 rounded px-2 py-1 ${
+                            inviteMode === 'link'
+                              ? 'bg-slate-700 text-slate-100'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          🔗 Link
+                        </button>
+                        <button
+                          onClick={() => setInviteMode('code')}
+                          className={`flex-1 rounded px-2 py-1 ${
+                            inviteMode === 'code'
+                              ? 'bg-slate-700 text-slate-100'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          🔢 Code
+                        </button>
+                      </div>
+
                       <p className="mb-2 text-[10px] uppercase tracking-wider text-slate-500">
                         Expires in
                       </p>
@@ -225,7 +270,7 @@ export default function App() {
                         {INVITE_PRESETS.map((p) => (
                           <button
                             key={p.label}
-                            onClick={() => issueInvite(p.seconds)}
+                            onClick={() => issueInvite(p.seconds, inviteMode)}
                             className="rounded bg-slate-800 px-2 py-1.5 text-xs font-medium hover:bg-slate-700"
                           >
                             {p.label}
@@ -246,7 +291,7 @@ export default function App() {
                           onClick={() => {
                             const m = parseInt(inviteMinutes, 10);
                             if (Number.isFinite(m) && m > 0) {
-                              issueInvite(m * 60);
+                              issueInvite(m * 60, inviteMode);
                             }
                           }}
                           disabled={!parseInt(inviteMinutes, 10)}
@@ -282,9 +327,12 @@ export default function App() {
 
           {inviteFeedback && (
             <p className="rounded-md border border-emerald-800/40 bg-emerald-900/20 p-2 text-center text-xs text-emerald-200">
+              {/* If clipboard write succeeded we set a friendly message
+                  starting with "Invite"; otherwise we set the raw value
+                  (token or full URL) so the user can copy it manually. */}
               {inviteFeedback.startsWith('Invite')
                 ? inviteFeedback
-                : `Invite token: ${inviteFeedback}`}
+                : `Invite: ${inviteFeedback}`}
             </p>
           )}
 

@@ -39,6 +39,9 @@ export interface UseAnalyticsResult {
   byDay: DayBucket[];
   loading: boolean;
   error: string | null;
+  // True when the call_sessions table is missing from PostgREST's schema
+  // cache — usually means the 0009 migration hasn't been applied yet.
+  schemaMissing: boolean;
   refresh: () => Promise<void>;
 }
 
@@ -58,6 +61,14 @@ function rowToSession(r: any): CallSession {
   };
 }
 
+// PostgREST: PGRST205 = "table missing from schema cache". We also fall
+// back to a substring match in case the code field is ever missing.
+function isMissingTableError(err: { code?: string; message?: string } | null): boolean {
+  if (!err) return false;
+  if (err.code === 'PGRST205') return true;
+  return !!err.message && /schema cache/i.test(err.message);
+}
+
 // Format the local-tz YYYY-MM-DD for a Date.
 function localDateKey(d: Date): string {
   const pad = (n: number) => n.toString().padStart(2, '0');
@@ -69,6 +80,7 @@ export function useAnalytics(): UseAnalyticsResult {
   const [sessions, setSessions] = useState<CallSession[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [schemaMissing, setSchemaMissing] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!user) {
@@ -87,9 +99,16 @@ export function useAnalytics(): UseAnalyticsResult {
         // into the lobby. Replace with pagination if you ever need it.
         .limit(500);
       if (err) {
-        setError(err.message);
+        if (isMissingTableError(err)) {
+          setSchemaMissing(true);
+          setSessions([]);
+          setError(null);
+        } else {
+          setError(err.message);
+        }
         return;
       }
+      setSchemaMissing(false);
       setSessions((data ?? []).map(rowToSession));
       setError(null);
     } finally {
@@ -146,5 +165,5 @@ export function useAnalytics(): UseAnalyticsResult {
     return { totals: t, byDay: days };
   }, [sessions]);
 
-  return { sessions, totals, byDay, loading, error, refresh };
+  return { sessions, totals, byDay, loading, error, schemaMissing, refresh };
 }

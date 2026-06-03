@@ -51,7 +51,12 @@ export interface UseBackgroundBlurResult {
   error: string | null;
   enabled: boolean;   // start() has been called (and not yet stop())
   blurredStream: MediaStream | null;
-  start: () => Promise<void>;
+  // Resolves to the produced MediaStream (containing the blurred video
+  // track) on success, or null on failure. Callers should prefer this
+  // return value over reading `blurredStream` from state immediately
+  // after start() — React batches state updates, so `blurredStream`
+  // will still be the previous render's value for one tick.
+  start: () => Promise<MediaStream | null>;
   stop: () => void;
 }
 
@@ -127,11 +132,11 @@ export function useBackgroundBlur(opts: BlurOptions): UseBackgroundBlurResult {
     }
   }, [source, enabled]);
 
-  const start = useCallback(async () => {
-    if (enabled) return;
+  const start = useCallback(async (): Promise<MediaStream | null> => {
+    if (enabled) return outputStreamRef.current;
     if (!source) {
       setError('No camera stream to blur.');
-      return;
+      return null;
     }
     setError(null);
     setLoading(true);
@@ -272,10 +277,16 @@ export function useBackgroundBlur(opts: BlurOptions): UseBackgroundBlurResult {
       rafRef.current = requestAnimationFrame(renderLoop);
       setEnabled(true);
       setLoading(false);
+      // Return the stream directly so the caller doesn't have to wait
+      // for React state to flush before using it. captureStream may
+      // still need one frame to populate tracks; the caller can use
+      // waitForFirstVideoTrack(out) to handle that.
+      return out;
     } catch (e: any) {
       setError(`Could not start background blur: ${e?.message ?? e}`);
       setLoading(false);
       teardown();
+      return null;
     }
   }, [blurRadius, enabled, ready, source, targetFps, teardown]);
 

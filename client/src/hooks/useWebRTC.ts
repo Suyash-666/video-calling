@@ -199,6 +199,10 @@ export function useWebRTC(): UseWebRTCResult {
   const channelRef = useRef<RealtimeChannel | null>(null);
   const roomIdRef = useRef<string | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  // Stable join timestamp for THIS tab. Captured once on join and
+  // reused on every republish so toggling mic/cam/hand doesn't
+  // reshuffle the participant grid or look like a re-join.
+  const joinedAtRef = useRef<number>(0);
   const peersRef = useRef<Map<string, PeerEntry>>(new Map());
   const cameraVideoTrackRef = useRef<MediaStreamTrack | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -366,6 +370,9 @@ export function useWebRTC(): UseWebRTCResult {
   const publishPresence = useCallback(async () => {
     const ch = channelRef.current;
     if (!ch || !selfId) return;
+    // First publish stamps joinedAtRef; subsequent publishes reuse it
+    // so the row is updated in place rather than appearing as a re-join.
+    if (joinedAtRef.current === 0) joinedAtRef.current = Date.now();
     const row: PresenceRow = {
       id: selfId,
       name: selfName,
@@ -373,7 +380,7 @@ export function useWebRTC(): UseWebRTCResult {
       micOn,
       camOn,
       handRaised,
-      joinedAt: Date.now(),
+      joinedAt: joinedAtRef.current,
     };
     try {
       await ch.track(row);
@@ -508,9 +515,23 @@ export function useWebRTC(): UseWebRTCResult {
 
       ch.on('presence', { event: 'sync' }, () => {
         const state = ch.presenceState();
-        const rows: PresenceRow[] = (
-          Object.values(state).flat() as unknown as PresenceRow[]
-        ).filter((r) => r?.id);
+        // Dedup by user id. presenceState returns { presenceKey -> rows[] }
+        // and a single tab is normally one key, but transient
+        // reconnects (cold mobile networks, brief signaling loss) can
+        // briefly leave a stale key alongside the fresh one. Counting
+        // both as separate participants is what was inflating the
+        // grid + capacity on a hand-raise toggle. Last-write-wins by
+        // joinedAt (highest = most recent track), so the live row is
+        // the one we surface.
+        const dedup = new Map<string, PresenceRow>();
+        for (const row of Object.values(state).flat() as unknown as PresenceRow[]) {
+          if (!row?.id) continue;
+          const existing = dedup.get(row.id);
+          if (!existing || (row.joinedAt ?? 0) >= (existing.joinedAt ?? 0)) {
+            dedup.set(row.id, row);
+          }
+        }
+        const rows: PresenceRow[] = Array.from(dedup.values());
 
         // Soft capacity check.
         if (rows.length > MAX_PARTICIPANTS) {
@@ -659,13 +680,23 @@ export function useWebRTC(): UseWebRTCResult {
       setRole(mode);
 
       await startLocalMedia();
-      const ch = roomChannel(id);
+      // Presence key combines user id + a per-tab nonce so:
+      //   - the same user in two tabs counts as two participants
+      //   - a reconnect within one tab reuses the same key, so the
+      //     stale row collapses in place server-side instead of
+      //     piling up alongside the fresh one
+      const presenceKey = `${selfId}:${uuid()}`;
+      const ch = roomChannel(id, presenceKey);
       attachSignaling(ch);
       channelRef.current = ch;
 
       await new Promise<void>((resolve, reject) => {
         ch.subscribe(async (subStatus) => {
           if (subStatus === 'SUBSCRIBED') {
+            // Stamp the stable joinedAt once; publishPresence reuses
+            // the same value on every later track() so the row updates
+            // in place instead of looking like a re-join.
+            joinedAtRef.current = Date.now();
             await ch.track({
               id: selfId,
               name: selfName,
@@ -673,7 +704,7 @@ export function useWebRTC(): UseWebRTCResult {
               micOn: true,
               camOn: true,
               handRaised: false,
-              joinedAt: Date.now(),
+              joinedAt: joinedAtRef.current,
             } satisfies PresenceRow);
             setStatus('in-call');
             // Analytics: stamp the call's start time and seed our own
@@ -860,6 +891,7 @@ export function useWebRTC(): UseWebRTCResult {
       setWaiting(null);
       setWaitingRoomEnabledState(false);
       peersRef.current.clear();
+      joinedAtRef.current = 0;
       setMicOn(true);
       setCamOn(true);
       setHandRaised(false);
@@ -1071,6 +1103,7 @@ export function useWebRTC(): UseWebRTCResult {
     setChat([]);
     setReactions([]);
     setHandRaised(false);
+    joinedAtRef.current = 0;
   }, [bumpPeerTick, role, stopRecordingInternal]);
 
   useEffect(() => {
@@ -1257,10 +1290,10 @@ export function useWebRTC(): UseWebRTCResult {
       setError('Camera is not ready yet.');
       return;
     }
-    await blur.start();
-    const blurred = blur.blurredStream;
-    // start() resolves before the first frame is composited, so the
-    // captured stream may not yet have tracks. Wait one rAF tick.
+    // Get the stream directly from start() — reading blur.blurredStream
+    // here would be the previous render's value (React batches state),
+    // which is what caused the "failed to produce a video track" error.
+    const blurred = await blur.start();
     const blurredTrack = await waitForFirstVideoTrack(blurred);
     if (!blurredTrack) {
       setError('Background blur failed to produce a video track.');

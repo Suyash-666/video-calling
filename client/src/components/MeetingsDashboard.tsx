@@ -9,6 +9,8 @@
 
 import { useMemo, useState } from 'react';
 import { useMeetings, type ScheduledMeeting } from '../hooks/useMeetings';
+import { MigrationHint } from './MigrationHint';
+import { buildInviteLink } from '../lib/inviteLink';
 
 interface Props {
   onJoin: (roomId: string, inviteToken?: string) => void;
@@ -19,6 +21,7 @@ export function MeetingsDashboard({ onJoin }: Props) {
     meetings,
     loading,
     error,
+    schemaMissing,
     createMeeting,
     cancelMeeting,
     canJoinNow,
@@ -66,7 +69,9 @@ export function MeetingsDashboard({ onJoin }: Props) {
       await navigator.clipboard.writeText(link);
       setFeedback('Invite link copied to clipboard');
     } catch {
-      setFeedback(`Invite token: ${result.inviteToken}`);
+      // Clipboard blocked (e.g. iframe without permission); show the
+      // full link inline so the host can copy it manually.
+      setFeedback(`Invite link: ${link}`);
     }
     setTimeout(() => setFeedback(null), 6000);
 
@@ -91,7 +96,9 @@ export function MeetingsDashboard({ onJoin }: Props) {
           </button>
           <button
             onClick={() => setCreating((c) => !c)}
-            className="rounded bg-brand-500 px-3 py-1 text-xs font-semibold text-white hover:bg-brand-600"
+            disabled={schemaMissing}
+            className="rounded bg-brand-500 px-3 py-1 text-xs font-semibold text-white hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
+            title={schemaMissing ? 'Apply the 0008 migration first' : undefined}
           >
             {creating ? 'Cancel' : '+ Schedule'}
           </button>
@@ -146,12 +153,19 @@ export function MeetingsDashboard({ onJoin }: Props) {
         <p className="mt-2 text-center text-xs text-red-400">{error}</p>
       )}
 
+      {schemaMissing && (
+        <MigrationHint
+          migration="0008_scheduled_meetings.sql"
+          feature="Scheduled meetings"
+        />
+      )}
+
       <div className="mt-3 flex flex-col gap-3">
-        {loading && meetings.length === 0 && (
+        {!schemaMissing && loading && meetings.length === 0 && (
           <p className="text-center text-xs text-slate-500">Loading…</p>
         )}
 
-        {!loading && meetings.length === 0 && !creating && (
+        {!schemaMissing && !loading && meetings.length === 0 && !creating && (
           <p className="text-center text-xs text-slate-500">
             No upcoming meetings. Schedule one to see it here.
           </p>
@@ -330,10 +344,6 @@ function formatWhen(epochMs: number): string {
   }).format(d);
 }
 
-// We don't ship a routed invite URL yet — the lobby's "I have an invite
-// code" flow is what guests use. So the link is currently the bare token,
-// which the recipient pastes into that field. When you add a real
-// router, replace this with `${origin}/#/room/${roomId}?invite=${token}`.
-function buildInviteLink(_roomId: string, token: string): string {
-  return token;
-}
+// (buildInviteLink lives in lib/inviteLink so the in-call invite UI,
+// the lobby's join-via-link flow, and this dashboard all produce
+// identical URLs.)

@@ -42,11 +42,21 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 // One channel per room. Channel name is the room id, prefixed with `room:`.
 // `self: false` on broadcast means we do NOT receive our own messages back,
 // which simplifies the WebRTC hook.
-export function roomChannel(roomId: string): RealtimeChannel {
+//
+// Presence key:
+//   We use the caller's user id, NOT a fresh random uuid per channel.
+//   With a random key, a brief network blip that triggers a re-subscribe
+//   gets a brand-new key — the stale row from the previous key lingers
+//   server-side until its heartbeat expires, and the dedup pass on the
+//   receiver counts both as separate participants. Keying on user id
+//   means a reconnect collapses back to a single row in place. We still
+//   add a small ":<random>" suffix so the same user in two tabs counts
+//   as two presence rows (each tab needs its own).
+export function roomChannel(roomId: string, presenceKey: string): RealtimeChannel {
   return supabase.channel(`room:${roomId}`, {
     config: {
       broadcast: { ack: false, self: false },
-      presence: { key: crypto.randomUUID() },
+      presence: { key: presenceKey },
     },
   });
 }

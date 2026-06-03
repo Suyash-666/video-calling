@@ -18,8 +18,7 @@
 --     SELECT sessions + participants for their own rooms; nothing else
 --     is readable. INSERTs happen via the SECURITY DEFINER RPC.
 --   - Guests do NOT post their own analytics rows; the host's client is
---     the single source of truth. A future server-si
-de aggregator could
+--     the single source of truth. A future server-side aggregator could
 --     replace this with a Realtime trigger if you need cross-host views.
 --
 -- How to apply:

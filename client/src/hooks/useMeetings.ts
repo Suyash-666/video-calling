@@ -32,6 +32,11 @@ export interface UseMeetingsResult {
   meetings: ScheduledMeeting[];
   loading: boolean;
   error: string | null;
+  // True when the backend reports the scheduled_meetings table is
+  // missing from its schema cache (PGRST205) — almost always means the
+  // 0008 migration hasn't been applied yet. The UI uses this to show a
+  // friendly hint instead of red error text.
+  schemaMissing: boolean;
   // Create a meeting and pre-mint a long-lived invite. Returns the new
   // meeting row plus the invite token (paste-into-calendar friendly).
   createMeeting: (input: {
@@ -63,11 +68,21 @@ function rowToMeeting(r: any): ScheduledMeeting {
   };
 }
 
+// PostgREST tags "table not in the schema cache" with code PGRST205.
+// We also match on the message string as a belt-and-braces fallback in
+// case the code field is ever missing.
+function isMissingTableError(err: { code?: string; message?: string } | null): boolean {
+  if (!err) return false;
+  if (err.code === 'PGRST205') return true;
+  return !!err.message && /schema cache/i.test(err.message);
+}
+
 export function useMeetings(): UseMeetingsResult {
   const { user } = useAuth();
   const [meetings, setMeetings] = useState<ScheduledMeeting[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [schemaMissing, setSchemaMissing] = useState(false);
   // A "now" tick state we bump every 30s so canJoinNow re-evaluates and
   // the Join button enables on time without the user clicking refresh.
   const [, setNowTick] = useState(0);
@@ -92,9 +107,18 @@ export function useMeetings(): UseMeetingsResult {
         )
         .order('scheduled_for', { ascending: true });
       if (err) {
-        setError(err.message);
+        // Special-case the "you forgot to apply 0008" failure so the UI
+        // can render a yellow hint rather than red error text.
+        if (isMissingTableError(err)) {
+          setSchemaMissing(true);
+          setMeetings([]);
+          setError(null);
+        } else {
+          setError(err.message);
+        }
         return;
       }
+      setSchemaMissing(false);
       setMeetings((data ?? []).map(rowToMeeting));
       setError(null);
     } finally {
@@ -181,11 +205,21 @@ export function useMeetings(): UseMeetingsResult {
       meetings,
       loading,
       error,
+      schemaMissing,
       createMeeting,
       cancelMeeting,
       canJoinNow,
       refresh,
     }),
-    [meetings, loading, error, createMeeting, cancelMeeting, canJoinNow, refresh]
+    [
+      meetings,
+      loading,
+      error,
+      schemaMissing,
+      createMeeting,
+      cancelMeeting,
+      canJoinNow,
+      refresh,
+    ]
   );
 }

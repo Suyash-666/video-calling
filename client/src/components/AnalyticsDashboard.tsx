@@ -20,9 +20,11 @@ import {
   YAxis,
 } from 'recharts';
 import { useAnalytics, type CallSession } from '../hooks/useAnalytics';
+import { MigrationHint } from './MigrationHint';
 
 export function AnalyticsDashboard() {
-  const { sessions, totals, byDay, loading, error, refresh } = useAnalytics();
+  const { sessions, totals, byDay, loading, error, schemaMissing, refresh } =
+    useAnalytics();
   const [open, setOpen] = useState(true);
 
   // Headline numbers, formatted for display.
@@ -60,7 +62,12 @@ export function AnalyticsDashboard() {
 
       {open && (
         <>
-          {loading && sessions.length === 0 ? (
+          {schemaMissing ? (
+            <MigrationHint
+              migration="0009_meeting_analytics.sql"
+              feature="Meeting analytics"
+            />
+          ) : loading && sessions.length === 0 ? (
             <p className="mt-3 text-center text-xs text-slate-500">Loading…</p>
           ) : sessions.length === 0 ? (
             <p className="mt-3 text-center text-xs text-slate-500">

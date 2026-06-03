@@ -1,18 +1,28 @@
 // components/Lobby.tsx
-// Pre-call screen with two entry points:
-//   - Join Room:   user types an existing room id AND an invite token
-//                  (issued by the host) and joins as guest.
-//   - Create Room: generates a fresh id, joins as host. After the call
-//                  connects, the host can mint an invite from the
-//                  in-call header to share with a guest.
+// Pre-call screen with three entry points:
+//   - Join Room:      user types a room id (+ optional invite code) and
+//                     joins as guest.
+//   - Join via link:  user pastes a full invite URL (or the path part)
+//                     and the lobby parses out roomId + token for them.
+//   - Create Room:    generates a fresh id, joins as host.
+//
+// Auto-join: if the page is opened with a `#/join/<room>/<token>` URL
+// (e.g. someone clicked an invite link), we pre-fill the inputs AND
+// immediately call onJoin. The URL is cleared from the address bar so
+// a refresh doesn't re-trigger.
 //
 // The user must be signed in (parent gates this), so we also render a
 // small "signed in as … · Sign out" header.
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useAuth } from '../lib/auth';
 import { MeetingsDashboard } from './MeetingsDashboard';
 import { AnalyticsDashboard } from './AnalyticsDashboard';
+import {
+  clearInviteFromUrl,
+  parseInviteLink,
+  readInviteFromUrl,
+} from '../lib/inviteLink';
 
 interface Props {
   onJoin: (roomId: string, inviteToken?: string) => void;
@@ -31,9 +41,37 @@ function makeRoomId() {
 export function Lobby({ onJoin, busy, error }: Props) {
   const { user, signOut } = useAuth();
   const [roomId, setRoomId] = useState('demo');
-  const [copied, setCopied] = useState(false);
   const [useInvite, setUseInvite] = useState(false);
   const [inviteToken, setInviteToken] = useState('');
+
+  // Paste-a-link UX. Hidden behind a toggle so the lobby stays compact;
+  // hosts who share full URLs put their guests one click + one paste
+  // away from being in the room.
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [linkInput, setLinkInput] = useState('');
+  const [linkError, setLinkError] = useState<string | null>(null);
+
+  // Auto-join if the page was opened with an invite URL. We trigger this
+  // exactly once per mount (the ref guards against StrictMode's double-
+  // render in dev) so we don't keep re-firing if `onJoin` happens to be
+  // recreated upstream.
+  const autoJoinedRef = useRef(false);
+  useEffect(() => {
+    if (autoJoinedRef.current) return;
+    const fromUrl = readInviteFromUrl();
+    if (!fromUrl) return;
+    autoJoinedRef.current = true;
+    // Pre-fill the form so the user has visible feedback about what we
+    // parsed, then call onJoin. We also flip useInvite on so the input
+    // shows up if they cancel and want to edit.
+    setRoomId(fromUrl.roomId);
+    setUseInvite(true);
+    setInviteToken(fromUrl.token);
+    // Strip the hash so a refresh doesn't auto-join again with a
+    // potentially already-used token.
+    clearInviteFromUrl();
+    onJoin(fromUrl.roomId, fromUrl.token);
+  }, [onJoin]);
 
   const submitJoin = (e: React.FormEvent) => {
     e.preventDefault();
@@ -45,23 +83,32 @@ export function Lobby({ onJoin, busy, error }: Props) {
     onJoin(id, useInvite ? inviteToken.trim() || undefined : undefined);
   };
 
+  const submitLink = (e: React.FormEvent) => {
+    e.preventDefault();
+    setLinkError(null);
+    const parts = parseInviteLink(linkInput);
+    if (!parts) {
+      setLinkError(
+        "That doesn't look like an invite link. Expected something like https://your-app/#/join/<room>/<token>"
+      );
+      return;
+    }
+    // Mirror what auto-join does: pre-fill the form so the user can see
+    // what we got, then enter the room.
+    setRoomId(parts.roomId);
+    setUseInvite(true);
+    setInviteToken(parts.token);
+    setLinkOpen(false);
+    setLinkInput('');
+    onJoin(parts.roomId, parts.token);
+  };
+
   const createRoom = () => {
     const id = makeRoomId();
     setRoomId(id);
-    setCopied(false);
     // Hosts don't need an invite token — they self-insert via the
     // create_room_with_host RPC.
     onJoin(id);
-  };
-
-  const copyId = async () => {
-    try {
-      await navigator.clipboard.writeText(roomId);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard can be blocked; non-fatal.
-    }
   };
 
   // Surface a friendly hint if the user hasn't configured Supabase yet.
@@ -88,7 +135,8 @@ export function Lobby({ onJoin, busy, error }: Props) {
 
       <h1 className="text-center text-2xl font-semibold">Zoom Mini</h1>
       <p className="text-center text-sm text-slate-400">
-        Create a new room as host, or join an existing one with an invite code.
+        Create a new room, join one with a room id + invite code, or
+        paste an invite link.
       </p>
 
       {envMissing && (
@@ -147,6 +195,47 @@ export function Lobby({ onJoin, busy, error }: Props) {
           </button>
         </div>
       </form>
+
+      {/* Join-via-link: a single paste does both fields. Hosts who share
+          full URLs let their guests skip the room-id / code juggling. */}
+      <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+        <button
+          type="button"
+          onClick={() => {
+            setLinkOpen((o) => !o);
+            setLinkError(null);
+          }}
+          className="flex w-full items-center justify-between text-left text-xs font-medium text-slate-300 hover:text-slate-100"
+          aria-expanded={linkOpen}
+        >
+          <span>🔗 Join via invite link</span>
+          <span className="text-slate-500">{linkOpen ? '▴' : '▾'}</span>
+        </button>
+
+        {linkOpen && (
+          <form onSubmit={submitLink} className="mt-2 flex flex-col gap-2">
+            <input
+              value={linkInput}
+              onChange={(e) => setLinkInput(e.target.value)}
+              placeholder="Paste the full invite link from the host"
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              className="rounded-md border border-slate-700 bg-slate-800 px-3 py-2 text-xs outline-none focus:border-brand-500"
+            />
+            <button
+              type="submit"
+              disabled={busy || !linkInput.trim()}
+              className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {busy ? 'Joining…' : 'Open link'}
+            </button>
+            {linkError && (
+              <p className="text-[11px] text-red-400">{linkError}</p>
+            )}
+          </form>
+        )}
+      </div>
 
       {error && <p className="text-center text-sm text-red-400">{error}</p>}
 
