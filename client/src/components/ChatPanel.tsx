@@ -1,10 +1,14 @@
 // components/ChatPanel.tsx
-// A simple side panel that slides in from the right. Receives the chat
-// list and a `send` callback. The parent (App) decides whether it's open
-// via a tab button on the right edge.
+//
+// A side panel that slides in from the right. Re-styled to match
+// the new design system: no shadow, hairline border, the "you"
+// message is rendered with a hairline border and white text
+// (no blue background), and the input is borderless with the
+// amber-underline focus treatment.
 
 import { useEffect, useRef, useState } from 'react';
 import type { ChatMessage } from '../types';
+import { CloseIcon } from './Icons';
 
 interface Props {
   open: boolean;
@@ -43,38 +47,46 @@ export function ChatPanel({ open, messages, loading, onSend, onClose }: Props) {
       {/* Backdrop on small screens so taps outside close the panel. */}
       {open && (
         <div
-          className="fixed inset-0 z-30 bg-black/30 md:hidden"
+          className="fixed inset-0 z-30 bg-black/40 md:hidden"
           onClick={onClose}
           aria-hidden
         />
       )}
 
       <aside
-        className={`fixed right-0 top-0 z-40 flex h-full w-80 max-w-[90vw] flex-col border-l border-slate-800 bg-slate-900 shadow-2xl transition-transform duration-200 ${
-          open ? 'translate-x-0' : 'translate-x-full'
-        }`}
+        className={`fixed right-0 top-0 z-40 flex h-full w-96 max-w-[90vw]
+                    flex-col border-l border-white/[0.06] bg-field
+                    transition-transform duration-240 ease-out
+                    ${open ? 'translate-x-0' : 'translate-x-full'}`}
         aria-hidden={!open}
       >
-        <header className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
-          <h2 className="text-sm font-semibold">Chat</h2>
+        <header className="flex items-center justify-between
+                          border-b border-white/[0.06] px-6 py-4">
+          <p className="micro-label">CHAT</p>
           <button
             onClick={onClose}
-            className="rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+            className="text-ink-500 outline-none
+                       transition-colors duration-180 ease-out
+                       hover:text-ink-200"
             aria-label="Close chat"
           >
-            ✕
+            <CloseIcon size={16} />
           </button>
         </header>
 
-        <div ref={listRef} className="flex-1 space-y-2 overflow-y-auto px-3 py-3">
+        <div
+          ref={listRef}
+          className="flex-1 space-y-3 overflow-y-auto px-6 py-4"
+        >
           {loading && (
-            <p className="text-center text-[10px] uppercase tracking-wider text-slate-500">
+            <p className="text-center text-micro uppercase
+                        tracking-[0.12em] text-ink-500">
               Loading history…
             </p>
           )}
           {!loading && messages.length === 0 && (
-            <p className="mt-8 text-center text-xs text-slate-500">
-              No messages yet. Say hi 👋
+            <p className="mt-8 text-center text-small text-ink-500">
+              No messages yet. Say hi.
             </p>
           )}
           {messages.map((m) => (
@@ -83,17 +95,17 @@ export function ChatPanel({ open, messages, loading, onSend, onClose }: Props) {
               className={`flex ${isMe(m) ? 'justify-end' : 'justify-start'}`}
             >
               <div
-                className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm ${
-                  isMe(m)
-                    ? 'rounded-br-sm bg-brand-500 text-white'
-                    : 'rounded-bl-sm bg-slate-800 text-slate-100'
-                }`}
+                className={`max-w-[80%] rounded-md px-3 py-2
+                            ${isMe(m)
+                              ? 'border border-accent/30 bg-accent/5 text-ink-50'
+                              : 'border border-white/[0.06] bg-surface text-ink-200'}`}
               >
-                <p className="whitespace-pre-wrap break-words">{m.text}</p>
+                <p className="whitespace-pre-wrap break-words text-small">
+                  {m.text}
+                </p>
                 <p
-                  className={`mt-1 text-[10px] ${
-                    isMe(m) ? 'text-blue-100/80' : 'text-slate-400'
-                  }`}
+                  className={`mt-1 font-mono text-[10px]
+                              ${isMe(m) ? 'text-accent/70' : 'text-ink-500'}`}
                 >
                   {formatTime(m.at)}
                 </p>
@@ -104,18 +116,20 @@ export function ChatPanel({ open, messages, loading, onSend, onClose }: Props) {
 
         <form
           onSubmit={submit}
-          className="flex gap-2 border-t border-slate-800 p-3"
+          className="flex items-center gap-4 border-t
+                     border-white/[0.06] px-6 py-4"
         >
           <input
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder="Type a message…"
-            className="flex-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm outline-none focus:border-brand-500"
+            className="input-bare-sm flex-1"
           />
           <button
             type="submit"
             disabled={!draft.trim()}
-            className="rounded-lg bg-brand-500 px-3 py-2 text-sm font-semibold text-white hover:bg-brand-600 disabled:opacity-50"
+            aria-disabled={!draft.trim()}
+            className="action-primary"
           >
             Send
           </button>

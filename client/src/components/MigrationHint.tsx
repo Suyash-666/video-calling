@@ -1,9 +1,12 @@
 // components/MigrationHint.tsx
+//
 // Friendly banner shown by the lobby dashboards when their backing
 // table is missing from PostgREST's schema cache — almost always
 // because the named migration hasn't been applied to the Supabase
-// project yet. Replaces the previous red "could not find the table"
-// error text with something actionable.
+// project yet. Replaces the previous amber card with a single
+// hairline-divided row in the same style as the rest of the
+// dashboard. We don't shout about this; the user is in a develop-
+// ment flow and a one-line instruction is enough.
 
 interface Props {
   migration: string;
@@ -12,16 +15,17 @@ interface Props {
 
 export function MigrationHint({ migration, feature }: Props) {
   return (
-    <div className="mt-3 rounded-lg border border-amber-700/40 bg-amber-900/20 p-3 text-xs text-amber-200">
-      <p className="font-semibold">{feature} isn’t available yet.</p>
-      <p className="mt-1 text-amber-200/80">
-        Apply the SQL migration to your Supabase project to enable it:
+    <div className="flex flex-col gap-2 border-t hairline-t py-6">
+      <p className="micro-label text-state-error">
+        {feature} not available
       </p>
-      <p className="mt-1 font-mono text-[11px] text-amber-100">
-        supabase/migrations/{migration}
-      </p>
-      <p className="mt-1 text-amber-200/70">
-        Dashboard → SQL Editor → New query → paste the file → Run.
+      <p className="text-small leading-relaxed text-ink-400">
+        Apply the SQL migration to your Supabase project to enable it.
+        Path:{' '}
+        <span className="font-mono text-ink-200">
+          supabase/migrations/{migration}
+        </span>
+        . Run it in the Supabase Dashboard's SQL Editor.
       </p>
     </div>
   );

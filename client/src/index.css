@@ -1,3 +1,239 @@
+/* Inter for UI sans, Geist Mono for system values.
+   We load from Google Fonts because Inter Variable ships there with
+   the full weight range (300-700) in a single URL. The mono is on
+   the same request to keep the initial paint quiet. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* ----------------------------------------------------------------------------
+   Base layer
+   -------------------------------------------------------------------------- */
+
+@layer base {
+  html {
+    /* Tabular figures everywhere a number shows up — durations,
+       timestamps, participant counts. Proportional digits create
+       the "wiggle" that makes a list look unrefined. */
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-field font-sans text-body text-ink-200 antialiased;
+  }
+
+  /* Inputs inherit font; placeholders are quieter than body. */
+  input,
+  button,
+  textarea,
+  select {
+    @apply font-sans;
+  }
+
+  ::placeholder {
+    @apply text-ink-500;
+  }
+
+  /* Custom selection — single-color, no UI blue. */
+  ::selection {
+    background: rgba(232, 196, 122, 0.25);
+    color: #FAFAF9;
+  }
+
+  /* Focus ring is amber, 2px, 4px offset. We use :focus-visible
+     so mouse clicks don't show a ring but keyboard nav does. */
+  *:focus-visible {
+    outline: 2px solid #E8C47A;
+    outline-offset: 4px;
+    border-radius: 2px;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+   Components
+   -------------------------------------------------------------------------- */
+
+@layer components {
+  /* Micro-label: the kind that says "ROOM" or "DURATION".
+     11px, uppercase, +60 tracking, ink-500. Used above a value
+     to give it context. */
+  .micro-label {
+    @apply text-micro font-medium uppercase text-ink-500;
+  }
+
+  /* Hairline border, used everywhere instead of slate-700.
+     A 1px white-6% line is more refined than a colored border. */
+  .hairline {
+    border-color: rgba(255, 255, 255, 0.06);
+  }
+  .hairline-t { border-top: 1px solid rgba(255, 255, 255, 0.06); }
+  .hairline-b { border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
+  .hairline-r { border-right: 1px solid rgba(255, 255, 255, 0.06); }
+  .hairline-l { border-left: 1px solid rgba(255, 255, 255, 0.06); }
+
+  /* Display headline utility. Use directly on <h1>/<h2> rather than
+     via font-size classes so a designer can tune the scale in one
+     place (tailwind.config.js). */
+  .display-lg { @apply text-display-lg; }
+  .display-md { @apply text-display-md; }
+  .display-sm { @apply text-display-sm; }
+
+  /* Primary action: a text link with an amber underline that
+     animates in. The hover/focus underline grows from 0 to 100%
+     width over 240ms. The text is white; the underline is the
+     only color. This replaces the "big blue button" pattern. */
+  .action-primary {
+    @apply relative inline-flex items-center gap-2 text-ink-50
+           font-medium tracking-tight outline-none;
+  }
+  .action-primary::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -3px;
+    height: 1px;
+    background: #E8C47A;
+    transform: scaleX(0);
+    transform-origin: left center;
+    transition: transform 240ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  .action-primary:hover::after,
+  .action-primary:focus-visible::after {
+    transform: scaleX(1);
+  }
+  .action-primary[aria-disabled='true'],
+  .action-primary:disabled {
+    @apply text-ink-500 cursor-not-allowed;
+  }
+  .action-primary[aria-disabled='true']::after,
+  .action-primary:disabled::after {
+    display: none;
+  }
+
+  /* Secondary action: text only, ink-400, no underline. */
+  .action-secondary {
+    @apply text-ink-400 font-normal outline-none
+           transition-colors duration-180 ease-out;
+  }
+  .action-secondary:hover,
+  .action-secondary:focus-visible {
+    @apply text-ink-200;
+  }
+
+  /* Borderless text input. A single 1px hairline at the bottom
+     becomes the amber accent on focus. No box, no rounded corners. */
+  .input-bare {
+    @apply w-full bg-transparent text-display-sm text-ink-50
+           font-medium tracking-tight placeholder:text-ink-700
+           outline-none pb-3 pt-2;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    transition: border-color 180ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  .input-bare:focus {
+    border-bottom-color: #E8C47A;
+  }
+
+  /* Small input for the "invite code" sub-field. */
+  .input-bare-sm {
+    @apply w-full bg-transparent text-body text-ink-200
+           font-mono placeholder:text-ink-700
+           outline-none pb-2 pt-1;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    transition: border-color 180ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  .input-bare-sm:focus {
+    border-bottom-color: #E8C47A;
+  }
+
+  /* Live indicator: 6px dot, amber, with a soft pulse. Used on
+     active calls, ongoing meetings, and "in progress" badges. */
+  .live-dot {
+    @apply inline-block h-1.5 w-1.5 rounded-full;
+    background: #E8C47A;
+    box-shadow: 0 0 0 0 rgba(232, 196, 122, 0.5);
+    animation: livePulse 2.4s cubic-bezier(0.2, 0, 0, 1) infinite;
+  }
+
+  /* A row in a list (meetings, etc.). Hairline divider, 24px
+     vertical padding, 4-column flex layout with right-aligned
+     actions. The hover lifts to ink-50 to signal interactivity. */
+  .row {
+    @apply flex items-center gap-6 py-6 outline-none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    transition: background-color 180ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  .row:hover {
+    background: rgba(255, 255, 255, 0.015);
+  }
+  .row:last-child {
+    border-bottom: none;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+   Utilities
+   -------------------------------------------------------------------------- */
+
+@layer utilities {
+  /* The ambient gradient on the auth page. A very slow vertical
+     sweep that loops over 30s. It's barely perceptible, which is
+     the point — the page should feel alive, not animated. */
+  .ambient-veil {
+    background:
+      radial-gradient(
+        120% 80% at 50% 0%,
+        rgba(232, 196, 122, 0.06) 0%,
+        rgba(232, 196, 122, 0) 60%
+      ),
+      linear-gradient(180deg, #0A0A0B 0%, #0C0C0F 100%);
+    animation: ambientShift 30s ease-in-out infinite;
+  }
+
+  /* A 1px noise overlay you can drop on surfaces to break up
+     flat color fields. Uses a base64-encoded PNG so we don't need
+     to ship an asset. Disabled by default — only enable for hero
+     sections. */
+  .noise-overlay {
+    position: relative;
+  }
+  .noise-overlay::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.025;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' /%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' /%3E%3C/svg%3E");
+  }
+}
+
+/* ----------------------------------------------------------------------------
+   Keyframes
+   -------------------------------------------------------------------------- */
+
+@keyframes livePulse {
+  0%   { box-shadow: 0 0 0 0 rgba(232, 196, 122, 0.5); }
+  60%  { box-shadow: 0 0 0 6px rgba(232, 196, 122, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(232, 196, 122, 0); }
+}
+
+@keyframes ambientShift {
+  0%, 100% { background-position: 50% 0%, 0 0; }
+  50%      { background-position: 50% 12%, 0 0; }
+}
+
+/* Reduce motion: kill the ambient veil and the live dot pulse.
+   The auth page stays still for users with this preference. */
+@media (prefers-reduced-motion: reduce) {
+  .ambient-veil {
+    animation: none;
+  }
+  .live-dot {
+    animation: none;
+  }
+}

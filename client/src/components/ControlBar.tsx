@@ -1,11 +1,32 @@
 // components/ControlBar.tsx
-// The bottom bar with mute / camera / screen / record / raise / react / hang-up.
-// Everything except the reactions popover is a simple button; the
-// reactions popover is local UI state.
+//
+// The in-call control surface. Re-styled to match the new design
+// system: a single hairline-bordered pill, anchored to the bottom
+// of the screen, with icon-only buttons. Buttons gain a subtle
+// filled background when active. The hang-up control is a
+// distinct red square on the right edge of the pill — the only
+// color in the control surface, by design.
+//
+// No emoji. The previous version had 🎙 🔇 📷 🚫 🖥 ✨ etc. as
+// button labels; emoji read as casual. The new icons are
+// stroked SVGs from ./Icons, the same set used elsewhere.
 
 import { useState } from 'react';
 import type { MediaControls, RecordingControls, ReactionEmoji } from '../types';
 import { REACTION_EMOJIS } from '../types';
+import {
+  BlurIcon,
+  ChatIcon,
+  CloseIcon,
+  HandIcon,
+  HangupIcon,
+  MicIcon,
+  MicOffIcon,
+  PeopleIcon,
+  ScreenIcon,
+  VideoIcon,
+  VideoOffIcon,
+} from './Icons';
 
 interface Props {
   controls: MediaControls;
@@ -16,6 +37,10 @@ interface Props {
   onToggleParticipants: () => void;
   participantCount: number;
   onHangUp: () => void;
+  // Chat is opened from a slide-in panel, not from the bar. We
+  // keep the count in the icon for at-a-glance feedback.
+  chatUnread?: number;
+  onToggleChat?: () => void;
 }
 
 // Format seconds as MM:SS — used by the recording indicator.
@@ -23,6 +48,59 @@ function fmtElapsed(sec: number): string {
   const m = Math.floor(sec / 60).toString().padStart(2, '0');
   const s = (sec % 60).toString().padStart(2, '0');
   return `${m}:${s}`;
+}
+
+// PillButton: the atomic control. Icon-only, 40x40 square, with
+// three visual states: default (no background), active (ink-700
+// background, used for "this thing is on"), and danger (red,
+// used only for "this thing is off — fix it"). Hover lifts the
+// icon color from ink-400 to ink-50.
+function PillButton({
+  active,
+  activeColor = 'ink',
+  danger,
+  disabled,
+  onClick,
+  title,
+  ariaLabel,
+  ariaPressed,
+  children,
+}: {
+  active?: boolean;
+  activeColor?: 'ink' | 'amber';
+  danger?: boolean;
+  disabled?: boolean;
+  onClick?: () => void;
+  title?: string;
+  ariaLabel: string;
+  ariaPressed?: boolean;
+  children: React.ReactNode;
+}) {
+  // Three background colors keyed to state. The amber color is
+  // used only for raise-hand (the only positive "raise" gesture
+  // in the bar) — it earns the accent.
+  const bg = active
+    ? activeColor === 'amber'
+      ? 'bg-accent/15 text-accent'
+      : 'bg-ink-700 text-ink-50'
+    : danger
+      ? 'bg-state-error/15 text-state-error'
+      : 'text-ink-400 hover:text-ink-50 hover:bg-white/[0.04]';
+
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      aria-pressed={ariaPressed}
+      title={title}
+      className={`flex h-10 w-10 items-center justify-center rounded-full
+                  outline-none transition-colors duration-180 ease-out
+                  disabled:cursor-not-allowed disabled:opacity-30 ${bg}`}
+    >
+      {children}
+    </button>
+  );
 }
 
 export function ControlBar({
@@ -34,142 +112,146 @@ export function ControlBar({
   onToggleParticipants,
   participantCount,
   onHangUp,
+  chatUnread = 0,
+  onToggleChat,
 }: Props) {
   const [reactOpen, setReactOpen] = useState(false);
 
   return (
-    <div className="flex flex-wrap items-center justify-center gap-3">
-      <button
+    // The bar is a single rounded-full pill with a hairline
+    // border. It floats above the bottom of the viewport by 24px
+    // (the parent in App.tsx positions it). The pill is centered
+    // horizontally.
+    <div className="flex items-center gap-1 rounded-full border
+                    border-white/[0.08] bg-surface/90 px-2 py-1.5
+                    backdrop-blur-md">
+      {/* Mic. Off state shows the crossed-out icon and a subtle
+          red wash — a small cue that audio isn't flowing. */}
+      <PillButton
         onClick={controls.toggleMic}
-        className={`rounded-full px-5 py-3 text-sm font-medium transition ${
-          controls.micOn
-            ? 'bg-slate-700 hover:bg-slate-600'
-            : 'bg-red-600 hover:bg-red-500'
-        }`}
-        aria-label={controls.micOn ? 'Mute microphone' : 'Unmute microphone'}
+        active={controls.micOn}
+        danger={!controls.micOn}
+        ariaLabel={controls.micOn ? 'Mute microphone' : 'Unmute microphone'}
       >
-        {controls.micOn ? '🎙 Mute' : '🔇 Unmute'}
-      </button>
+        {controls.micOn ? <MicIcon /> : <MicOffIcon />}
+      </PillButton>
 
-      <button
+      {/* Camera. Same pattern. Disabled while screen sharing
+          because we replace the sender's track with the screen
+          track, so the camera is "paused". */}
+      <PillButton
         onClick={controls.toggleCam}
         disabled={controls.screenOn}
-        className={`rounded-full px-5 py-3 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
-          controls.camOn
-            ? 'bg-slate-700 hover:bg-slate-600'
-            : 'bg-red-600 hover:bg-red-500'
-        }`}
-        aria-label={controls.camOn ? 'Turn camera off' : 'Turn camera on'}
+        active={controls.camOn}
+        danger={!controls.camOn}
         title={
           controls.screenOn
             ? 'Camera is paused while screen sharing'
             : undefined
         }
+        ariaLabel={controls.camOn ? 'Turn camera off' : 'Turn camera on'}
       >
-        {controls.camOn ? '📷 Camera off' : '🚫 Camera on'}
-      </button>
+        {controls.camOn ? <VideoIcon /> : <VideoOffIcon />}
+      </PillButton>
 
-      <button
-        onClick={() => {
-          void controls.toggleScreenShare();
-        }}
-        className={`rounded-full px-5 py-3 text-sm font-medium transition ${
-          controls.screenOn
-            ? 'bg-emerald-600 hover:bg-emerald-500'
-            : 'bg-slate-700 hover:bg-slate-600'
-        }`}
-        aria-label={controls.screenOn ? 'Stop sharing screen' : 'Share screen'}
+      {/* Screen share. Active state shows the same icon in the
+          "ink-700" background — there is no separate "stop" icon
+          in the new system. Tapping again stops the share. */}
+      <PillButton
+        onClick={() => void controls.toggleScreenShare()}
+        active={controls.screenOn}
+        ariaLabel={controls.screenOn ? 'Stop sharing screen' : 'Share screen'}
       >
-        {controls.screenOn ? '🛑 Stop sharing' : '🖥 Share screen'}
-      </button>
+        <ScreenIcon />
+      </PillButton>
 
-      {/* Background blur toggle. Disabled while screen sharing (the
-          screen track is what peers want to see, not the camera). First
-          tap loads the segmentation model (~2.5MB), so we surface a
-          loading state. */}
-      <button
-        onClick={() => {
-          void controls.toggleBlur();
-        }}
+      {/* Background blur. Uses the accent-soft background when
+          on — this is the one place the amber accent reappears
+          in the control bar, because blur is a positive "look
+          better" feature rather than a control state. */}
+      <PillButton
+        onClick={() => void controls.toggleBlur()}
         disabled={controls.screenOn || controls.blurLoading}
-        className={`rounded-full px-5 py-3 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
-          controls.blurOn
-            ? 'bg-indigo-600 hover:bg-indigo-500'
-            : 'bg-slate-700 hover:bg-slate-600'
-        }`}
-        aria-pressed={controls.blurOn}
-        aria-label={controls.blurOn ? 'Turn off background blur' : 'Blur background'}
+        active={controls.blurOn}
+        activeColor="amber"
         title={
           controls.screenOn
             ? 'Blur is unavailable during screen sharing'
             : undefined
         }
+        ariaPressed={controls.blurOn}
+        ariaLabel={
+          controls.blurOn ? 'Turn off background blur' : 'Blur background'
+        }
       >
-        {controls.blurLoading
-          ? '⏳ Loading…'
-          : controls.blurOn
-            ? '✨ Blur on'
-            : '🌫 Blur'}
-      </button>
+        <BlurIcon />
+      </PillButton>
 
-      {/* Record toggle with live MM:SS while recording. */}
+      {/* Recording. The active state shows a pulsing live dot
+          and a tabular-num MM:SS. Tapping stops. */}
       <button
         onClick={() => {
           if (recording.isRecording) recording.stopRecording();
           else void recording.startRecording();
         }}
-        className={`flex items-center gap-2 rounded-full px-5 py-3 text-sm font-medium transition ${
-          recording.isRecording
-            ? 'bg-red-600 hover:bg-red-500'
-            : 'bg-slate-700 hover:bg-slate-600'
-        }`}
-        aria-label={
-          recording.isRecording ? 'Stop recording' : 'Start recording'
-        }
+        disabled={recording.loading}
+        className={`flex h-10 items-center gap-2 rounded-full px-3
+                    text-small font-medium outline-none
+                    transition-colors duration-180 ease-out
+                    disabled:opacity-30
+                    ${
+                      recording.isRecording
+                        ? 'bg-state-error/15 text-state-error'
+                        : 'text-ink-400 hover:bg-white/[0.04] hover:text-ink-50'
+                    }`}
+        aria-label={recording.isRecording ? 'Stop recording' : 'Start recording'}
       >
         {recording.isRecording ? (
           <>
-            <span
-              className="inline-block h-2.5 w-2.5 rounded-full bg-white"
-              style={{ animation: 'recPulse 1s ease-in-out infinite' }}
-            />
-            <span className="tabular-nums">
-              {fmtElapsed(recording.elapsedSec)}
-            </span>
-            <span>Stop</span>
+            <span className="live-dot" />
+            <span className="font-mono">{fmtElapsed(recording.elapsedSec)}</span>
           </>
         ) : (
-          <>⏺ Record</>
+          <span className="flex items-center gap-2">
+            <span className="inline-block h-1.5 w-1.5 rounded-full bg-current" />
+            Rec
+          </span>
         )}
       </button>
 
-      {/* Raise / lower own hand. */}
-      <button
-        onClick={onToggleHand}
-        className={`rounded-full px-5 py-3 text-sm font-medium transition ${
-          handRaised
-            ? 'bg-amber-500 text-slate-900 hover:bg-amber-400'
-            : 'bg-slate-700 hover:bg-slate-600'
-        }`}
-        aria-pressed={handRaised}
-        aria-label={handRaised ? 'Lower hand' : 'Raise hand'}
-      >
-        ✋ {handRaised ? 'Lower hand' : 'Raise hand'}
-      </button>
+      {/* Vertical divider. A 1px hairline at the visual center of
+          the pill, 24px tall, separating the media controls
+          (left) from the social controls (right). */}
+      <div className="mx-2 h-6 w-px bg-white/[0.06]" />
 
-      {/* Reactions popover. */}
+      {/* Raise hand. Active state uses the amber accent — the
+          only positive highlight in the bar. */}
+      <PillButton
+        onClick={onToggleHand}
+        active={handRaised}
+        activeColor="amber"
+        ariaPressed={handRaised}
+        ariaLabel={handRaised ? 'Lower hand' : 'Raise hand'}
+      >
+        <HandIcon />
+      </PillButton>
+
+      {/* Reactions popover. The popover floats above the bar; we
+          close it after a selection. The popover uses a similar
+          pill style to the bar itself so it visually belongs. */}
       <div className="relative">
-        <button
+        <PillButton
           onClick={() => setReactOpen((o) => !o)}
-          className="rounded-full bg-slate-700 px-5 py-3 text-sm font-medium hover:bg-slate-600"
-          aria-haspopup="menu"
-          aria-expanded={reactOpen}
+          ariaLabel="Send reaction"
         >
-          😀 React
-        </button>
+          <span className="text-body leading-none">☺</span>
+        </PillButton>
         {reactOpen && (
           <div
-            className="absolute bottom-full left-1/2 z-30 mb-2 flex -translate-x-1/2 gap-1 rounded-full border border-slate-700 bg-slate-900 px-2 py-1 shadow-xl"
+            className="absolute bottom-full left-1/2 z-30 mb-2
+                       flex -translate-x-1/2 gap-1 rounded-full
+                       border border-white/[0.08] bg-surface
+                       px-2 py-1.5"
             role="menu"
           >
             {REACTION_EMOJIS.map((e) => (
@@ -179,7 +261,9 @@ export function ControlBar({
                   onSendReaction(e);
                   setReactOpen(false);
                 }}
-                className="rounded-full px-2 py-1 text-2xl transition hover:bg-slate-700"
+                className="rounded-full px-2 py-1 text-xl outline-none
+                           transition-colors duration-180 ease-out
+                           hover:bg-white/[0.06]"
                 aria-label={`Send ${e}`}
               >
                 {e}
@@ -189,27 +273,56 @@ export function ControlBar({
         )}
       </div>
 
-      <button
-        onClick={onToggleParticipants}
-        className="rounded-full bg-slate-700 px-5 py-3 text-sm font-medium hover:bg-slate-600"
-        aria-label="Toggle participants panel"
-      >
-        👥 {participantCount}
-      </button>
+      {/* Chat. Optional — the chat panel may not be openable
+          from this build yet. Show a small unread count if any. */}
+      {onToggleChat && (
+        <PillButton
+          onClick={onToggleChat}
+          ariaLabel="Toggle chat"
+        >
+          <span className="relative">
+            <ChatIcon />
+            {chatUnread > 0 && (
+              <span
+                className="absolute -right-2 -top-2
+                           min-w-[16px] rounded-full
+                           bg-accent px-1 text-center
+                           font-mono text-[10px] font-medium
+                           text-field"
+              >
+                {chatUnread}
+              </span>
+            )}
+          </span>
+        </PillButton>
+      )}
 
+      {/* Participants. The count renders next to the icon. */}
+      <PillButton
+        onClick={onToggleParticipants}
+        ariaLabel="Toggle participants panel"
+      >
+        <span className="flex items-center gap-1.5">
+          <PeopleIcon />
+          <span className="font-mono text-small">{participantCount}</span>
+        </span>
+      </PillButton>
+
+      {/* Hangup. Visually separated from the rest of the pill by
+          a thin divider and rendered as a red square. The
+          squareness is intentional: the pill is a friendly
+          control surface, the red square is a terminal action. */}
+      <div className="mx-2 h-6 w-px bg-white/[0.06]" />
       <button
         onClick={onHangUp}
-        className="rounded-full bg-red-600 px-5 py-3 text-sm font-medium text-white hover:bg-red-500"
+        aria-label="Hang up"
+        className="flex h-10 w-10 items-center justify-center
+                   rounded-md bg-state-error/90 text-white
+                   outline-none transition-colors duration-180 ease-out
+                   hover:bg-state-error"
       >
-        ☎ Hang up
+        <HangupIcon />
       </button>
-
-      <style>{`
-        @keyframes recPulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.3; }
-        }
-      `}</style>
     </div>
   );
 }

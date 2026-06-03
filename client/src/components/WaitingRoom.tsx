@@ -1,17 +1,21 @@
 // components/WaitingRoom.tsx
+//
 // Two paired pieces for the waiting-room feature:
-//   - <WaitingScreen> : full-screen splash a guest sees while they wait
-//                       for the host to approve them.
+//   - <WaitingScreen> : full-screen splash a guest sees while they
+//                       wait for the host to approve them.
 //   - <WaitingRoomPanel>: host-side inbox of pending requests with
 //                         approve / reject buttons.
 //
-// Both are pure presentational — every bit of state comes from the
-// useWebRTC hook, which already wires the Realtime subscriptions.
+// Both are pure presentational — every bit of state comes from
+// the useWebRTC hook, which already wires the Realtime
+// subscriptions. Re-styled to match the new system: no card
+// chrome, no shadows, no emoji.
 
 import { useEffect, useState } from 'react';
 import type { PendingRequest, WaitingState } from '../types';
+import { ArrowRightIcon, CloseIcon, HandIcon } from './Icons';
 
-// --- Guest splash ---------------------------------------------------------
+// --- Guest splash --------------------------------------------------------
 
 interface WaitingScreenProps {
   waiting: WaitingState;
@@ -19,8 +23,9 @@ interface WaitingScreenProps {
 }
 
 export function WaitingScreen({ waiting, onCancel }: WaitingScreenProps) {
-  // Live-tick MM:SS since we started waiting. setInterval is fine — we
-  // don't need sub-second precision and the page is otherwise idle.
+  // Live-tick MM:SS since we started waiting. setInterval is fine
+  // — we don't need sub-second precision and the page is
+  // otherwise idle.
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
     const t = window.setInterval(() => {
@@ -32,65 +37,66 @@ export function WaitingScreen({ waiting, onCancel }: WaitingScreenProps) {
   const rejected = waiting.status === 'rejected';
 
   return (
-    <div className="flex min-h-[80vh] w-full items-center justify-center">
-      <div className="w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 p-8 text-center shadow-2xl">
+    <div className="flex min-h-screen w-full items-center
+                    justify-center px-8">
+      <div className="w-full max-w-md">
         {rejected ? (
           <>
-            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-red-900/40 text-3xl">
-              ✋
-            </div>
-            <h2 className="text-lg font-semibold text-slate-200">
-              The host declined your request
-            </h2>
-            <p className="mt-2 text-sm text-slate-400">
-              You can try a different room or ask the host for a new invite.
+            <p className="micro-label mb-6 text-state-error">
+              REQUEST DECLINED
+            </p>
+            <h1 className="display-md text-ink-50">
+              The host said no.
+            </h1>
+            <p className="mt-6 max-w-sm text-body text-ink-400">
+              Try a different room, or ask the host to mint you a
+              fresh invite.
             </p>
             <button
               onClick={onCancel}
-              className="mt-6 w-full rounded-md bg-slate-800 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700"
+              className="action-primary mt-12"
             >
               Back to lobby
+              <ArrowRightIcon size={14} className="opacity-60" />
             </button>
           </>
         ) : (
           <>
-            <div
-              className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-slate-800 text-3xl"
-              style={{ animation: 'pulseRing 1.6s ease-in-out infinite' }}
-            >
-              ⌛
+            <p className="micro-label mb-6 text-accent">WAITING</p>
+            <h1 className="display-md text-ink-50">
+              Hold on a moment.
+            </h1>
+            <p className="mt-6 max-w-sm text-body text-ink-400">
+              The host hasn't approved your request yet. We'll put
+              you in as soon as they do.
+            </p>
+            <div className="mt-12 flex items-center gap-6">
+              <div className="flex items-center gap-3">
+                <span className="live-dot" />
+                <span className="font-mono text-small text-ink-200">
+                  {waiting.roomId}
+                </span>
+              </div>
+              <span className="font-mono text-small text-ink-500">
+                {formatMmSs(elapsed)} elapsed
+              </span>
             </div>
-            <h2 className="text-lg font-semibold text-slate-200">
-              Waiting for the host to let you in
-            </h2>
-            <p className="mt-1 text-sm text-slate-400">
-              Room <span className="font-mono">{waiting.roomId}</span>
-            </p>
-            <p className="mt-3 text-xs tabular-nums text-slate-500">
-              {formatMmSs(elapsed)} elapsed
-            </p>
             <button
               onClick={onCancel}
-              className="mt-6 w-full rounded-md bg-slate-800 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700"
+              className="action-secondary mt-12 inline-flex
+                         items-center gap-2"
             >
-              Cancel
+              <CloseIcon size={14} />
+              Cancel request
             </button>
           </>
         )}
       </div>
-
-      <style>{`
-        @keyframes pulseRing {
-          0%   { box-shadow: 0 0 0 0 rgba(99,102,241,0.5); }
-          70%  { box-shadow: 0 0 0 14px rgba(99,102,241,0); }
-          100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
-        }
-      `}</style>
     </div>
   );
 }
 
-// --- Host inbox -----------------------------------------------------------
+// --- Host inbox ----------------------------------------------------------
 
 interface WaitingRoomPanelProps {
   enabled: boolean;
@@ -107,7 +113,8 @@ export function WaitingRoomPanel({
   onApprove,
   onReject,
 }: WaitingRoomPanelProps) {
-  // Click guard so a double-click doesn't fire two RPCs against the same row.
+  // Click guard so a double-click doesn't fire two RPCs against
+  // the same row.
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const wrap = async (id: string, fn: () => Promise<void>) => {
     setBusy((s) => new Set(s).add(id));
@@ -123,64 +130,73 @@ export function WaitingRoomPanel({
   };
 
   return (
-    <div className="rounded-lg border border-slate-700 bg-slate-900/80 p-3">
+    <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-            Waiting room
-          </h3>
-          <p className="mt-0.5 text-[11px] text-slate-500">
+          <p className="micro-label">WAITING ROOM</p>
+          <p className="mt-1 text-small text-ink-400">
             {enabled
               ? 'Guests must be approved before joining.'
               : 'Off — anyone with a valid invite joins immediately.'}
           </p>
         </div>
-        <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
+        <label className="flex cursor-pointer items-center gap-3
+                          text-small text-ink-400 outline-none
+                          transition-colors duration-180 ease-out
+                          hover:text-ink-200">
           <input
             type="checkbox"
             checked={enabled}
             onChange={(e) => {
               void onToggleEnabled(e.target.checked);
             }}
-            className="h-4 w-4 accent-emerald-500"
+            className="h-3 w-3 cursor-pointer accent-accent"
           />
           {enabled ? 'On' : 'Off'}
         </label>
       </div>
 
       {enabled && (
-        <div className="mt-3">
+        <div>
           {requests.length === 0 ? (
-            <p className="text-center text-xs text-slate-500">
+            <p className="py-4 text-center text-small text-ink-500">
               No one is waiting.
             </p>
           ) : (
-            <ul className="flex flex-col gap-1.5">
+            <ul className="flex flex-col">
               {requests.map((r) => (
                 <li
                   key={r.id}
-                  className="flex items-center justify-between gap-2 rounded-md bg-slate-800/60 px-2 py-1.5"
+                  className="flex items-center justify-between gap-4
+                             border-t border-white/[0.06] py-3"
                 >
-                  <div className="min-w-0">
-                    <p className="truncate text-sm text-slate-200">
-                      {r.displayName ?? `User ${r.userId.slice(0, 6)}`}
-                    </p>
-                    <p className="text-[10px] text-slate-500">
-                      asked {timeAgo(r.createdAt)}
-                    </p>
+                  <div className="flex min-w-0 items-center gap-3">
+                    <HandIcon size={14} className="text-accent" />
+                    <div className="min-w-0">
+                      <p className="truncate text-body text-ink-200">
+                        {r.displayName ??
+                          `User ${r.userId.slice(0, 6)}`}
+                      </p>
+                      <p className="text-micro uppercase
+                                   tracking-[0.12em] text-ink-500">
+                        asked {timeAgo(r.createdAt)}
+                      </p>
+                    </div>
                   </div>
-                  <div className="flex gap-1">
+                  <div className="flex items-center gap-4">
                     <button
                       onClick={() => wrap(r.id, () => onReject(r.id))}
                       disabled={busy.has(r.id)}
-                      className="rounded bg-slate-700 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-600 disabled:opacity-40"
+                      aria-disabled={busy.has(r.id)}
+                      className="action-secondary text-small"
                     >
                       Reject
                     </button>
                     <button
                       onClick={() => wrap(r.id, () => onApprove(r.id))}
                       disabled={busy.has(r.id)}
-                      className="rounded bg-emerald-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-emerald-500 disabled:opacity-40"
+                      aria-disabled={busy.has(r.id)}
+                      className="action-primary text-small"
                     >
                       Admit
                     </button>

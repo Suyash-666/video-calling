@@ -1,16 +1,25 @@
 // components/MeetingsDashboard.tsx
-// Lobby-side panel: list of upcoming + recent scheduled meetings,
-// inline form to create a new one, copy-link, cancel, and a "Join"
-// button that enables only inside the meeting's join window.
 //
-// Data + actions come from useMeetings. Joining is handed back to the
-// parent via onJoin (same signature the Lobby uses for its own buttons),
-// so this component stays unaware of useWebRTC.
+// Lobby-side panel: list of upcoming + recent scheduled meetings,
+// inline form to schedule a new one, cancel, and a "Join" link that
+// enables only inside the meeting's join window.
+//
+// Re-styled to match the new design system. The dashboard is no
+// longer a card of rows; it's a hairline-divided list with aligned
+// columns (TIME · DURATION · ROOM) and right-aligned actions. The
+// create form is inline but visually distinct from the list
+// itself.
 
 import { useMemo, useState } from 'react';
 import { useMeetings, type ScheduledMeeting } from '../hooks/useMeetings';
 import { MigrationHint } from './MigrationHint';
 import { buildInviteLink } from '../lib/inviteLink';
+import {
+  ArrowRightIcon,
+  CloseIcon,
+  PlusIcon,
+  RefreshIcon,
+} from './Icons';
 
 interface Props {
   onJoin: (roomId: string, inviteToken?: string) => void;
@@ -31,19 +40,21 @@ export function MeetingsDashboard({ onJoin }: Props) {
   // Inline-form state.
   const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState('');
-  // Defaults: 15 minutes from now, 30-minute meeting. Stored as datetime-local
-  // string (browser-formatted) so the <input type="datetime-local"> binds cleanly.
+  // Defaults: 15 minutes from now, 30-minute meeting. Stored as
+  // datetime-local string (browser-formatted) so the <input
+  // type="datetime-local"> binds cleanly.
   const [whenLocal, setWhenLocal] = useState(() =>
     toLocalDatetime(new Date(Date.now() + 15 * 60 * 1000))
   );
   const [duration, setDuration] = useState(30);
   const [feedback, setFeedback] = useState<string | null>(null);
 
-  // Split upcoming vs in-progress for nicer grouping; cancelled go last.
-  const grouped = useMemo(() => groupMeetings(meetings, canJoinNow), [
-    meetings,
-    canJoinNow,
-  ]);
+  // Split upcoming vs in-progress for nicer grouping; cancelled go
+  // last.
+  const grouped = useMemo(
+    () => groupMeetings(meetings, canJoinNow),
+    [meetings, canJoinNow]
+  );
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -60,98 +71,105 @@ export function MeetingsDashboard({ onJoin }: Props) {
     });
     if (!result) return;
 
-    // Build a shareable link. We use the room id + token in the hash so
-    // an existing route like #/room/<id>?invite=<token> would work; for
-    // now we copy the token alone (Lobby's "I have an invite code" UI is
-    // what the recipient pastes into).
     const link = buildInviteLink(result.meeting.roomId, result.inviteToken);
     try {
       await navigator.clipboard.writeText(link);
-      setFeedback('Invite link copied to clipboard');
+      setFeedback('Invite link copied to clipboard.');
     } catch {
-      // Clipboard blocked (e.g. iframe without permission); show the
-      // full link inline so the host can copy it manually.
       setFeedback(`Invite link: ${link}`);
     }
     setTimeout(() => setFeedback(null), 6000);
 
-    // Reset the form for the next meeting.
     setTitle('');
     setCreating(false);
   };
 
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+    <div className="flex flex-col gap-8">
+      {/* Header row. The micro-label on the left, action links on
+          the right. No card around it. */}
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-300">
-          Your meetings
-        </h2>
-        <div className="flex gap-2">
+        <p className="micro-label">SCHEDULED MEETINGS</p>
+        <div className="flex items-center gap-6 text-small">
           <button
             onClick={() => void refresh()}
-            className="rounded bg-slate-800 px-2 py-1 text-[11px] text-slate-300 hover:bg-slate-700"
+            disabled={loading}
+            className="action-secondary inline-flex items-center gap-2"
             title="Reload"
           >
-            ↻
+            <RefreshIcon size={14} className={loading ? 'animate-spin' : ''} />
+            Refresh
           </button>
           <button
             onClick={() => setCreating((c) => !c)}
             disabled={schemaMissing}
-            className="rounded bg-brand-500 px-3 py-1 text-xs font-semibold text-white hover:bg-brand-600 disabled:cursor-not-allowed disabled:opacity-40"
+            className="action-primary inline-flex items-center gap-2"
             title={schemaMissing ? 'Apply the 0008 migration first' : undefined}
           >
-            {creating ? 'Cancel' : '+ Schedule'}
+            <PlusIcon size={14} />
+            {creating ? 'Close' : 'Schedule'}
           </button>
         </div>
       </div>
 
+      {/* Inline create form. The two small fields sit on a single
+          row at md+ widths, stack on mobile. Submit is a text
+          link with underline, consistent with the rest of the
+          app. */}
       {creating && (
-        <form onSubmit={submit} className="mt-3 flex flex-col gap-2">
-          <input
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="Meeting title"
-            className="rounded border border-slate-700 bg-slate-800 px-3 py-2 text-sm outline-none focus:border-brand-500"
-            autoFocus
-          />
-          <div className="grid grid-cols-2 gap-2">
+        <form onSubmit={submit} className="flex flex-col gap-6">
+          <label className="block">
+            <span className="micro-label">TITLE</span>
             <input
-              type="datetime-local"
-              value={whenLocal}
-              onChange={(e) => setWhenLocal(e.target.value)}
-              className="rounded border border-slate-700 bg-slate-800 px-3 py-2 text-sm outline-none focus:border-brand-500"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Quarterly review"
+              className="input-bare mt-2"
+              autoFocus
             />
-            <select
-              value={duration}
-              onChange={(e) => setDuration(parseInt(e.target.value, 10))}
-              className="rounded border border-slate-700 bg-slate-800 px-3 py-2 text-sm outline-none focus:border-brand-500"
-            >
-              <option value={15}>15 min</option>
-              <option value={30}>30 min</option>
-              <option value={45}>45 min</option>
-              <option value={60}>1 hour</option>
-              <option value={90}>1.5 hours</option>
-              <option value={120}>2 hours</option>
-            </select>
+          </label>
+
+          <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+            <label className="block">
+              <span className="micro-label">STARTS</span>
+              <input
+                type="datetime-local"
+                value={whenLocal}
+                onChange={(e) => setWhenLocal(e.target.value)}
+                className="input-bare-sm mt-2 w-full"
+              />
+            </label>
+            <label className="block">
+              <span className="micro-label">DURATION</span>
+              <select
+                value={duration}
+                onChange={(e) => setDuration(parseInt(e.target.value, 10))}
+                className="input-bare-sm mt-2 w-full cursor-pointer
+                           appearance-none bg-transparent pr-6"
+              >
+                {[15, 30, 45, 60, 90, 120].map((m) => (
+                  <option key={m} value={m} className="bg-surface">
+                    {m} min
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
-          <button
-            type="submit"
-            className="rounded bg-emerald-600 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-500"
-          >
-            Schedule + copy invite link
-          </button>
+
+          <div className="flex items-center gap-6">
+            <button type="submit" className="action-primary">
+              Schedule + copy invite link
+              <ArrowRightIcon size={14} className="opacity-60" />
+            </button>
+          </div>
         </form>
       )}
 
       {feedback && (
-        <p className="mt-2 rounded-md border border-emerald-800/40 bg-emerald-900/20 p-2 text-center text-xs text-emerald-200">
-          {feedback}
-        </p>
+        <p className="text-small text-state-success">{feedback}</p>
       )}
 
-      {error && (
-        <p className="mt-2 text-center text-xs text-red-400">{error}</p>
-      )}
+      {error && <p className="text-small text-state-error">{error}</p>}
 
       {schemaMissing && (
         <MigrationHint
@@ -160,13 +178,17 @@ export function MeetingsDashboard({ onJoin }: Props) {
         />
       )}
 
-      <div className="mt-3 flex flex-col gap-3">
+      {/* List. Three sections: live (amber dot), upcoming, past.
+          Each row uses the .row utility from index.css. */}
+      <div className="flex flex-col">
         {!schemaMissing && loading && meetings.length === 0 && (
-          <p className="text-center text-xs text-slate-500">Loading…</p>
+          <p className="py-12 text-center text-small text-ink-500">
+            Loading…
+          </p>
         )}
 
         {!schemaMissing && !loading && meetings.length === 0 && !creating && (
-          <p className="text-center text-xs text-slate-500">
+          <p className="py-12 text-center text-small text-ink-500">
             No upcoming meetings. Schedule one to see it here.
           </p>
         )}
@@ -227,10 +249,8 @@ function Section({
 }) {
   return (
     <div>
-      <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">
-        {title}
-      </p>
-      <ul className="flex flex-col gap-1.5">{children}</ul>
+      <p className="micro-label py-4">{title}</p>
+      <ul className="flex flex-col">{children}</ul>
     </div>
   );
 }
@@ -246,46 +266,82 @@ function MeetingRow({
   canJoin: boolean;
   past?: boolean;
   onJoin: (roomId: string, inviteToken?: string) => void;
-  onCancel: (id: string) => void;
+  onCancel: (id: string) => Promise<void>;
 }) {
   return (
-    <li className="flex items-center gap-2 rounded-md bg-slate-800/40 px-3 py-2">
+    <li className="row">
+      {/* Left: live dot when canJoin. Otherwise a small dim dot to
+          keep the row's left edge aligned. */}
+      <div className="w-3 shrink-0">
+        {canJoin ? (
+          <span className="live-dot" />
+        ) : (
+          <span className="block h-1.5 w-1.5 rounded-full bg-ink-700" />
+        )}
+      </div>
+
+      {/* Title + when. Title is the dominant line, the when
+          renders below in micro type. */}
       <div className="min-w-0 flex-1">
         <p
-          className={`truncate text-sm ${
+          className={`truncate text-body ${
             m.cancelled
-              ? 'text-slate-500 line-through'
+              ? 'text-ink-500 line-through'
               : past
-                ? 'text-slate-400'
-                : 'text-slate-200'
+                ? 'text-ink-400'
+                : 'text-ink-50'
           }`}
         >
           {m.title}
         </p>
-        <p className="text-[10px] text-slate-500">
-          {formatWhen(m.scheduledFor)} · {m.durationMinutes} min · room{' '}
-          <span className="font-mono">{m.roomId}</span>
+        <p className="mt-1 text-micro uppercase tracking-[0.12em]
+                     text-ink-500">
+          {formatWhen(m.scheduledFor)}
         </p>
       </div>
-      {!m.cancelled && !past && (
-        <button
-          onClick={() => onJoin(m.roomId)}
-          disabled={!canJoin}
-          className="rounded bg-emerald-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
-          title={canJoin ? 'Open the room' : 'Join opens 5 min before start'}
-        >
-          Join
-        </button>
-      )}
-      {!m.cancelled && !past && (
-        <button
-          onClick={() => onCancel(m.id)}
-          className="rounded bg-slate-700 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-600"
-          title="Cancel this meeting"
-        >
-          ×
-        </button>
-      )}
+
+      {/* Aligned numeric columns. Duration in minutes, room id in
+          mono. Both tabular-nums via the global rule. */}
+      <div className="hidden w-24 shrink-0 text-right font-mono
+                      text-small text-ink-400 sm:block">
+        {m.durationMinutes}&nbsp;min
+      </div>
+      <div className="hidden w-40 shrink-0 truncate text-right
+                      font-mono text-small text-ink-500
+                      lg:block">
+        {m.roomId}
+      </div>
+
+      {/* Right-aligned actions. Join is the primary action (text
+          link with underline) and only renders when the meeting
+          is cancellable (not past, not cancelled). Cancel is a
+          secondary icon-only button. */}
+      <div className="flex shrink-0 items-center gap-6">
+        {!m.cancelled && !past && (
+          <button
+            onClick={() => onJoin(m.roomId)}
+            disabled={!canJoin}
+            aria-disabled={!canJoin}
+            className="action-primary"
+            title={canJoin ? 'Open the room' : 'Opens 5 min before start'}
+          >
+            Join
+            <ArrowRightIcon size={14} className="opacity-60" />
+          </button>
+        )}
+        {!m.cancelled && !past && (
+          <button
+            onClick={() => onCancel(m.id)}
+            className="text-ink-500 outline-none
+                       transition-colors duration-180 ease-out
+                       hover:text-ink-200"
+            title="Cancel this meeting"
+            aria-label="Cancel meeting"
+          >
+            <CloseIcon size={16} />
+          </button>
+        )}
+      </div>
     </li>
   );
 }
@@ -314,8 +370,6 @@ function groupMeetings(
   return { live, upcoming, past };
 }
 
-// Format `<input type="datetime-local">` value (YYYY-MM-DDTHH:mm in
-// local time) from a Date. The input does NOT accept timezone suffixes.
 function toLocalDatetime(d: Date): string {
   const pad = (n: number) => n.toString().padStart(2, '0');
   return (
@@ -326,15 +380,12 @@ function toLocalDatetime(d: Date): string {
 
 function parseLocalDatetime(s: string): Date | null {
   if (!s) return null;
-  // The string is local-time without an offset; Date() interprets it
-  // as local-time on construction, which is what we want.
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
 }
 
 function formatWhen(epochMs: number): string {
   const d = new Date(epochMs);
-  // Intl avoids hand-rolling tz logic and respects the user's locale.
   return new Intl.DateTimeFormat(undefined, {
     weekday: 'short',
     month: 'short',
@@ -343,7 +394,3 @@ function formatWhen(epochMs: number): string {
     minute: '2-digit',
   }).format(d);
 }
-
-// (buildInviteLink lives in lib/inviteLink so the in-call invite UI,
-// the lobby's join-via-link flow, and this dashboard all produce
-// identical URLs.)

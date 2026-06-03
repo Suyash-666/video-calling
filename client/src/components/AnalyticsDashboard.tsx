@@ -1,4 +1,5 @@
 // components/AnalyticsDashboard.tsx
+//
 // Lobby panel showing the host's meeting analytics:
 //   - Four stat tiles (calls, total hours, messages, participant-hours)
 //   - Bar chart: meetings per day (last 14 days)
@@ -6,6 +7,8 @@
 //   - Compact list of the most-recent sessions
 //
 // Data + derivations come from useAnalytics. Pure presentational.
+// Re-styled: stat tiles are typographic figures rather than
+// colored cards, charts use the single accent color, no shadows.
 
 import { useState } from 'react';
 import {
@@ -21,6 +24,13 @@ import {
 } from 'recharts';
 import { useAnalytics, type CallSession } from '../hooks/useAnalytics';
 import { MigrationHint } from './MigrationHint';
+import { ChevronDownIcon, RefreshIcon } from './Icons';
+
+// Chart colors. We use a single accent and a desaturated ink
+// value for the grid, mirroring the rest of the design system.
+const ACCENT = '#E8C47A';
+const GRID = 'rgba(255,255,255,0.04)';
+const AXIS = '#71717A';
 
 export function AnalyticsDashboard() {
   const { sessions, totals, byDay, loading, error, schemaMissing, refresh } =
@@ -32,33 +42,38 @@ export function AnalyticsDashboard() {
   const participantHours = (totals.totalParticipantSeconds / 3600).toFixed(1);
 
   return (
-    <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
+    <div className="flex flex-col gap-8">
       <div className="flex items-center justify-between">
         <button
           onClick={() => setOpen((o) => !o)}
-          className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-slate-300"
+          className="micro-label flex items-center gap-2 outline-none
+                     transition-colors duration-180 ease-out
+                     hover:text-ink-200"
           aria-expanded={open}
         >
-          <span>{open ? '▾' : '▸'}</span>
+          <ChevronDownIcon
+            size={12}
+            className={`transition-transform duration-180 ease-out
+                        ${open ? '' : '-rotate-90'}`}
+          />
           Meeting analytics
         </button>
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] text-slate-500">
+        <div className="flex items-center gap-6 text-small">
+          <span className="font-mono text-ink-500">
             {sessions.length} session{sessions.length === 1 ? '' : 's'}
           </span>
           <button
             onClick={() => void refresh()}
-            className="rounded bg-slate-800 px-2 py-1 text-[11px] text-slate-300 hover:bg-slate-700"
+            className="action-secondary inline-flex items-center gap-2"
             title="Reload"
           >
-            ↻
+            <RefreshIcon size={14} className={loading ? 'animate-spin' : ''} />
+            Refresh
           </button>
         </div>
       </div>
 
-      {error && (
-        <p className="mt-2 text-center text-xs text-red-400">{error}</p>
-      )}
+      {error && <p className="text-small text-state-error">{error}</p>}
 
       {open && (
         <>
@@ -68,87 +83,88 @@ export function AnalyticsDashboard() {
               feature="Meeting analytics"
             />
           ) : loading && sessions.length === 0 ? (
-            <p className="mt-3 text-center text-xs text-slate-500">Loading…</p>
+            <p className="py-12 text-center text-small text-ink-500">
+              Loading…
+            </p>
           ) : sessions.length === 0 ? (
-            <p className="mt-3 text-center text-xs text-slate-500">
-              No call sessions yet. Host a meeting and analytics will appear
-              here when it ends.
+            <p className="py-12 text-center text-small text-ink-500">
+              No call sessions yet. Host a meeting and analytics will
+              appear here when it ends.
             </p>
           ) : (
-            <div className="mt-3 flex flex-col gap-4">
-              {/* Stat tiles */}
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                <StatTile label="Calls" value={String(totals.callCount)} />
-                <StatTile label="Hours" value={totalHours} />
-                <StatTile
+            <div className="flex flex-col gap-8">
+              {/* Stat tiles. No card chrome — just micro-label +
+                  figure. The four figures are aligned in a 4-col
+                  grid with generous gap. */}
+              <div className="grid grid-cols-2 gap-8 sm:grid-cols-4">
+                <Stat label="Calls" value={String(totals.callCount)} />
+                <Stat label="Hours" value={totalHours} />
+                <Stat
                   label="Messages"
                   value={String(totals.totalMessages)}
                 />
-                <StatTile
+                <Stat
                   label="Participant-hrs"
                   value={participantHours}
                   hint="peak participants × duration"
                 />
               </div>
 
-              {/* Bar: meetings per day */}
-              <ChartCard title="Meetings per day (last 14 days)">
+              <Chart title="Meetings per day (last 14 days)">
                 <ResponsiveContainer width="100%" height={140}>
                   <BarChart
                     data={byDay}
                     margin={{ top: 6, right: 6, bottom: 0, left: -16 }}
                   >
-                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                    <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
                     <XAxis
                       dataKey="label"
-                      stroke="#64748b"
+                      stroke={AXIS}
                       style={{ fontSize: 10 }}
                     />
                     <YAxis
                       allowDecimals={false}
-                      stroke="#64748b"
+                      stroke={AXIS}
                       style={{ fontSize: 10 }}
                     />
                     <Tooltip
                       contentStyle={tooltipStyle}
-                      labelStyle={{ color: '#cbd5e1' }}
-                      cursor={{ fill: 'rgba(99,102,241,0.1)' }}
+                      labelStyle={{ color: '#E4E4E7' }}
+                      cursor={{ fill: 'rgba(232,196,122,0.06)' }}
                     />
-                    <Bar dataKey="callCount" fill="#6366f1" radius={[4, 4, 0, 0]} />
+                    <Bar dataKey="callCount" fill={ACCENT} radius={[2, 2, 0, 0]} />
                   </BarChart>
                 </ResponsiveContainer>
-              </ChartCard>
+              </Chart>
 
-              {/* Line: avg duration per day */}
-              <ChartCard title="Average duration per day (min)">
+              <Chart title="Average duration per day (min)">
                 <ResponsiveContainer width="100%" height={140}>
                   <LineChart
                     data={byDay}
                     margin={{ top: 6, right: 6, bottom: 0, left: -16 }}
                   >
-                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                    <CartesianGrid strokeDasharray="3 3" stroke={GRID} />
                     <XAxis
                       dataKey="label"
-                      stroke="#64748b"
+                      stroke={AXIS}
                       style={{ fontSize: 10 }}
                     />
-                    <YAxis stroke="#64748b" style={{ fontSize: 10 }} />
+                    <YAxis stroke={AXIS} style={{ fontSize: 10 }} />
                     <Tooltip
                       contentStyle={tooltipStyle}
-                      labelStyle={{ color: '#cbd5e1' }}
+                      labelStyle={{ color: '#E4E4E7' }}
                     />
                     <Line
                       type="monotone"
                       dataKey="avgDurationMin"
-                      stroke="#10b981"
-                      strokeWidth={2}
-                      dot={{ r: 2, fill: '#10b981' }}
+                      stroke={ACCENT}
+                      strokeWidth={1.5}
+                      dot={{ r: 2, fill: ACCENT, stroke: 'none' }}
                     />
                   </LineChart>
                 </ResponsiveContainer>
-              </ChartCard>
+              </Chart>
 
-              {/* Recent list */}
               <RecentSessions sessions={sessions.slice(0, 5)} />
             </div>
           )}
@@ -160,7 +176,7 @@ export function AnalyticsDashboard() {
 
 // --- Subcomponents --------------------------------------------------------
 
-function StatTile({
+function Stat({
   label,
   value,
   hint,
@@ -170,21 +186,16 @@ function StatTile({
   hint?: string;
 }) {
   return (
-    <div
-      className="rounded-lg bg-slate-800/60 px-3 py-2"
-      title={hint}
-    >
-      <div className="text-[10px] uppercase tracking-wider text-slate-500">
-        {label}
-      </div>
-      <div className="mt-0.5 text-lg font-semibold tabular-nums text-slate-100">
+    <div title={hint}>
+      <p className="micro-label">{label}</p>
+      <p className="mt-2 font-mono text-display-sm text-ink-50">
         {value}
-      </div>
+      </p>
     </div>
   );
 }
 
-function ChartCard({
+function Chart({
   title,
   children,
 }: {
@@ -192,10 +203,8 @@ function ChartCard({
   children: React.ReactNode;
 }) {
   return (
-    <div className="rounded-lg bg-slate-800/40 p-2">
-      <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">
-        {title}
-      </p>
+    <div>
+      <p className="micro-label mb-4">{title}</p>
       {children}
     </div>
   );
@@ -204,31 +213,36 @@ function ChartCard({
 function RecentSessions({ sessions }: { sessions: CallSession[] }) {
   return (
     <div>
-      <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">
-        Recent sessions
-      </p>
-      <ul className="flex flex-col gap-1">
+      <p className="micro-label mb-4">Recent sessions</p>
+      <ul className="flex flex-col">
         {sessions.map((s) => (
           <li
             key={s.id}
-            className="flex items-center justify-between gap-2 rounded-md bg-slate-800/40 px-3 py-1.5"
+            className="row"
           >
-            <div className="min-w-0">
-              <p className="truncate text-xs text-slate-200">
-                Room <span className="font-mono">{s.roomId}</span>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-body text-ink-200">
+                Room{' '}
+                <span className="font-mono text-ink-50">{s.roomId}</span>
               </p>
-              <p className="text-[10px] text-slate-500">
+              <p className="mt-1 text-micro uppercase
+                          tracking-[0.12em] text-ink-500">
                 {new Date(s.startedAt).toLocaleString()}
               </p>
             </div>
-            <div className="flex shrink-0 items-center gap-3 text-[11px] text-slate-400">
+            <div className="flex shrink-0 items-center gap-6 font-mono
+                            text-small text-ink-400">
               <span title="Duration">
-                ⏱ {formatDuration(s.durationSeconds)}
+                {formatDuration(s.durationSeconds)}
               </span>
               <span title="Peak participants">
-                👥 {s.peakParticipants}
+                <span className="text-ink-200">{s.peakParticipants}</span>
+                <span className="text-ink-500">&nbsp;ppl</span>
               </span>
-              <span title="Messages">💬 {s.messageCount}</span>
+              <span title="Messages">
+                <span className="text-ink-200">{s.messageCount}</span>
+                <span className="text-ink-500">&nbsp;msgs</span>
+              </span>
             </div>
           </li>
         ))}
@@ -240,10 +254,11 @@ function RecentSessions({ sessions }: { sessions: CallSession[] }) {
 // --- Helpers --------------------------------------------------------------
 
 const tooltipStyle: React.CSSProperties = {
-  backgroundColor: '#0f172a',
-  border: '1px solid #334155',
-  borderRadius: 6,
+  backgroundColor: '#111114',
+  border: '1px solid rgba(255,255,255,0.08)',
+  borderRadius: 4,
   fontSize: 11,
+  color: '#E4E4E7',
 };
 
 function formatDuration(sec: number): string {

@@ -59,42 +59,63 @@ export function VideoTile({
   });
 
   return (
-    <div className="relative aspect-video w-full overflow-hidden rounded-2xl bg-slate-800 shadow-lg ring-1 ring-slate-700">
+    // The tile is a flat surface with no shadow and no ring.
+    // 1px hairline border defines the edge; 4px radius keeps it
+    // from looking like a window. The video fills the entire
+    // surface; the label and hand badge sit on top with a quiet
+    // gradient at the bottom edge so the label is readable
+    // against any background.
+    <div className="relative aspect-video w-full overflow-hidden
+                    rounded border border-white/[0.06] bg-ink-700">
       <video
         ref={ref}
         autoPlay
         playsInline
         muted={muted}
-        // Local preview feels more natural mirrored; remote is true orientation.
+        // Local preview feels more natural mirrored; remote is
+        // true orientation.
         className={`h-full w-full object-cover ${mirrored ? '-scale-x-100' : ''} ${
           stream ? '' : 'invisible'
         }`}
       />
       {!stream && (
-        <div className="absolute inset-0 flex items-center justify-center text-slate-400">
-          {placeholder ?? 'Waiting for video…'}
+        <div className="absolute inset-0 flex items-center
+                       justify-center text-small text-ink-500">
+          {placeholder ?? 'Connecting…'}
         </div>
       )}
 
-      {/* Raised-hand badge — animated wave. */}
+      {/* Bottom gradient for label readability. Pure CSS, very
+          subtle so it doesn't fight the video. */}
+      <div className="pointer-events-none absolute inset-x-0
+                      bottom-0 h-20 bg-gradient-to-t
+                      from-black/40 to-transparent" />
+
+      {/* Raised-hand badge — a 6px amber dot in the top-right.
+          The pulse uses the .live-dot keyframe. No emoji. */}
       {handRaised && (
         <span
-          className="absolute right-2 top-2 select-none rounded-full bg-amber-500/90 px-2 py-1 text-lg shadow"
-          style={{ animation: 'handWave 1.2s ease-in-out infinite' }}
+          className="absolute right-3 top-3 flex items-center gap-2
+                     rounded-full bg-accent/15 px-2 py-1
+                     text-small text-accent"
           aria-label="Hand raised"
         >
-          ✋
+          <span className="live-dot" />
+          Hand
         </span>
       )}
 
-      {/* Reaction overlay — emojis float up from the bottom and fade. */}
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1/2 overflow-hidden">
+      {/* Reaction overlay — emojis float up from the bottom and
+          fade. Kept for parity with the prior behavior. */}
+      <div className="pointer-events-none absolute inset-x-0
+                      bottom-0 h-1/2 overflow-hidden">
         {(reactions ?? []).map((r) => (
           <span
             key={r.id}
             className="absolute bottom-2 select-none text-4xl"
-            // Spread reactions across the tile width pseudo-randomly via
-            // the uuid. Deterministic per reaction (no re-pick on rerender).
+            // Spread reactions across the tile width
+            // pseudo-randomly via the uuid. Deterministic per
+            // reaction (no re-pick on rerender).
             style={{
               left: `${10 + hashTo01(r.id) * 80}%`,
               animation: 'reactionFloat 3s ease-out forwards',
@@ -105,15 +126,15 @@ export function VideoTile({
         ))}
       </div>
 
-      <span className="absolute bottom-2 left-2 rounded-md bg-black/60 px-2 py-0.5 text-xs">
+      {/* Participant label. Bottom-left, micro type, no
+          background plate — the gradient below provides
+          contrast. */}
+      <span className="absolute bottom-2 left-3 text-small
+                      font-medium text-ink-50">
         {label}
       </span>
 
       <style>{`
-        @keyframes handWave {
-          0%, 100% { transform: rotate(-10deg); }
-          50% { transform: rotate(20deg); }
-        }
         @keyframes reactionFloat {
           0%   { transform: translateY(0)     scale(0.6); opacity: 0; }
           15%  { transform: translateY(-20px) scale(1.1); opacity: 1; }

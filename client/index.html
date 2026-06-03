@@ -3,9 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Zoom Mini — 1:1 Call</title>
+    <!--
+      The page background is set inline so the field color renders
+      before the CSS bundle loads. A white flash here would
+      undermine the "this is a serious product" first impression.
+    -->
+    <meta name="theme-color" content="#0A0A0B" />
+    <title>Zoom Mini</title>
+    <style>
+      html, body { background: #0A0A0B; color: #E4E4E7; margin: 0; }
+    </style>
   </head>
-  <body class="bg-slate-900 text-slate-100">
+  <body class="bg-field text-ink-200">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
