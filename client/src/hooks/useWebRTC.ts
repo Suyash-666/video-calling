@@ -176,12 +176,23 @@ export function useWebRTC(): UseWebRTCResult {
       ch.on('broadcast', { event: 'ice-candidate' }, onIce as any);
 
       // Presence: when both sides are tracked, decide who's the caller.
+      // We need a *deterministic* rule so exactly one peer initiates.
+      // Without this, both peers' presence-sync fires when the second
+      // joins, both see the other as "remote", both have localDescription
+      // === null, and both call startCall() — i.e. "glare". The two offers
+      // then collide in have-local-offer state and the negotiation fails,
+      // which is why chat works but video never connects.
+      //
+      // Rule: the peer with the lexicographically smaller user id is the
+      // caller. Same rule on both sides => exactly one offer.
       ch.on('presence', { event: 'sync' }, () => {
         const state = ch.presenceState();
-        const others = Object.values(state)
-          .flat()
-          .filter((p: any) => p?.id && p.id !== selfId);
-        if (others.length > 0 && pcRef.current?.localDescription === null) {
+        const others = (Object.values(state).flat() as Array<{ id?: string }>)
+          .filter((p) => p?.id && p.id !== selfId);
+        if (others.length === 0) return;
+        const peerId = others[0].id as string;
+        const iAmCaller = selfId < peerId;
+        if (iAmCaller && pcRef.current && !pcRef.current.localDescription) {
           startCall();
         }
       });
