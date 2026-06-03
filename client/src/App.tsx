@@ -206,8 +206,11 @@ export default function App() {
             <VideoTile
               stream={localStream}
               muted
-              mirrored
-              label="You"
+              // Mirror the camera preview (feels natural), but NOT when
+              // we're broadcasting the screen — flipped text would be
+              // confusing if we ever show the screen track here.
+              mirrored={!controls.screenOn}
+              label={controls.screenOn ? 'You (sharing screen)' : 'You'}
               placeholder="Starting camera…"
             />
             <VideoTile

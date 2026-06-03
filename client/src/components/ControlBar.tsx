@@ -25,14 +25,35 @@ export function ControlBar({ controls, onHangUp }: Props) {
 
       <button
         onClick={controls.toggleCam}
-        className={`rounded-full px-5 py-3 text-sm font-medium transition ${
+        disabled={controls.screenOn}
+        className={`rounded-full px-5 py-3 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
           controls.camOn
             ? 'bg-slate-700 hover:bg-slate-600'
             : 'bg-red-600 hover:bg-red-500'
         }`}
         aria-label={controls.camOn ? 'Turn camera off' : 'Turn camera on'}
+        title={
+          controls.screenOn
+            ? 'Camera is paused while screen sharing'
+            : undefined
+        }
       >
         {controls.camOn ? '📷 Camera off' : '🚫 Camera on'}
+      </button>
+
+      <button
+        onClick={() => {
+          // Fire-and-forget: the hook handles its own errors.
+          void controls.toggleScreenShare();
+        }}
+        className={`rounded-full px-5 py-3 text-sm font-medium transition ${
+          controls.screenOn
+            ? 'bg-emerald-600 hover:bg-emerald-500'
+            : 'bg-slate-700 hover:bg-slate-600'
+        }`}
+        aria-label={controls.screenOn ? 'Stop sharing screen' : 'Share screen'}
+      >
+        {controls.screenOn ? '🛑 Stop sharing' : '🖥 Share screen'}
       </button>
 
       <button

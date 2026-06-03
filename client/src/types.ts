@@ -6,8 +6,15 @@ export type CallStatus = 'idle' | 'joining' | 'in-call' | 'error';
 export interface MediaControls {
   micOn: boolean;
   camOn: boolean;
+  // True while we're broadcasting the screen instead of the camera.
+  // The video sender's track is swapped via RTCRtpSender.replaceTrack(),
+  // so no SDP renegotiation is needed.
+  screenOn: boolean;
   toggleMic: () => void;
   toggleCam: () => void;
+  // Toggles screen sharing on/off. If the user dismisses the browser's
+  // display-picker, this is a no-op and `screenOn` stays false.
+  toggleScreenShare: () => Promise<void>;
 }
 
 export interface RemoteState {

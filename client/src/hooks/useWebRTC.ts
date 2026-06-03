@@ -78,6 +78,7 @@ export function useWebRTC(): UseWebRTCResult {
   });
   const [micOn, setMicOn] = useState(true);
   const [camOn, setCamOn] = useState(true);
+  const [screenOn, setScreenOn] = useState(false);
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
 
@@ -85,6 +86,19 @@ export function useWebRTC(): UseWebRTCResult {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const channelRef = useRef<RealtimeChannel | null>(null);
   const roomIdRef = useRef<string | null>(null);
+  // The single video RTCRtpSender we use for both the camera track and
+  // the screen-share track. Grabbing it once at peer-creation time lets
+  // us swap tracks via `replaceTrack()` — no SDP renegotiation needed,
+  // because the transceiver/m-line is reused.
+  const videoSenderRef = useRef<RTCRtpSender | null>(null);
+  // The original camera track we displaced when starting a screen share.
+  // We keep a reference so we can put it back when screen share ends,
+  // without having to re-call getUserMedia (faster + no permission re-prompt).
+  const cameraVideoTrackRef = useRef<MediaStreamTrack | null>(null);
+  // The screen-capture stream we're currently broadcasting, if any.
+  // Held so we can stop *all* its tracks (incl. system audio if the
+  // user opted in) on toggle-off / hang-up.
+  const screenStreamRef = useRef<MediaStream | null>(null);
 
   // --- WebRTC plumbing (unchanged) ------------------------------------------
 
@@ -108,6 +122,11 @@ export function useWebRTC(): UseWebRTCResult {
     pcRef.current = pc;
 
     stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+    // Cache the video sender now so screen-share can swap its track
+    // later via replaceTrack() (no renegotiation needed).
+    videoSenderRef.current =
+      pc.getSenders().find((s) => s.track?.kind === 'video') ?? null;
 
     pc.ontrack = (ev) => {
       const incoming = ev.streams[0] ?? new MediaStream([ev.track]);
@@ -364,6 +383,17 @@ export function useWebRTC(): UseWebRTCResult {
       pc.close();
     }
     pcRef.current = null;
+    videoSenderRef.current = null;
+
+    // If a screen share is still active, kill its tracks too — the
+    // sender loop above only stops what's currently attached to the
+    // peer connection, which is the screen track; but a defensive
+    // pass over screenStreamRef catches the (multi-track) display
+    // stream including any system-audio track we never wired up.
+    screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+    screenStreamRef.current = null;
+    cameraVideoTrackRef.current = null;
+    setScreenOn(false);
 
     localStream?.getTracks().forEach((t) => t.stop());
     setLocalStream(null);
@@ -401,6 +431,109 @@ export function useWebRTC(): UseWebRTCResult {
     stream.getVideoTracks().forEach((t) => (t.enabled = next));
     setCamOn(next);
   }, [localStream, camOn]);
+
+  // --- Screen sharing -------------------------------------------------------
+  //
+  // We swap the *video sender's* track between the camera track and a
+  // display-capture track via RTCRtpSender.replaceTrack(). Because the
+  // transceiver (and therefore the m-line in the SDP) is unchanged, no
+  // renegotiation is required and the remote browser starts rendering
+  // the new frames as soon as they arrive.
+  //
+  // Audio is intentionally NOT swapped — the mic stays live during a
+  // share. If the user opts to share system/tab audio in the picker we
+  // ignore that audio track (replacing the mic track would be a more
+  // intrusive change and is out of scope here).
+
+  const stopScreenShare = useCallback(async () => {
+    const sender = videoSenderRef.current;
+    const cameraTrack = cameraVideoTrackRef.current;
+    const screenStream = screenStreamRef.current;
+
+    if (sender && cameraTrack) {
+      // Restore the camera on the wire. replaceTrack() returns a Promise
+      // but the API is fire-and-forget safe — we await for correctness.
+      try {
+        await sender.replaceTrack(cameraTrack);
+      } catch (e: any) {
+        setError(`Could not restore camera: ${e?.message ?? e}`);
+      }
+    }
+
+    // Tear down the display-capture stream's tracks so the browser's
+    // "Sharing your screen" indicator goes away.
+    screenStream?.getTracks().forEach((t) => t.stop());
+
+    screenStreamRef.current = null;
+    cameraVideoTrackRef.current = null;
+    setScreenOn(false);
+  }, []);
+
+  const startScreenShare = useCallback(async () => {
+    const sender = videoSenderRef.current;
+    if (!sender || !localStream) {
+      setError('Not ready to share screen yet.');
+      return;
+    }
+    let display: MediaStream;
+    try {
+      // `audio: true` is a hint — the browser shows an opt-in checkbox
+      // and may ignore it entirely. We accept whatever the user picks.
+      display = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
+    } catch (e: any) {
+      // The user dismissing the picker also lands here as a NotAllowedError.
+      // We only surface a real error if something other than dismissal happened.
+      if (e?.name !== 'NotAllowedError') {
+        setError(`Could not start screen share: ${e?.message ?? e}`);
+      }
+      return;
+    }
+
+    const screenTrack = display.getVideoTracks()[0];
+    if (!screenTrack) {
+      display.getTracks().forEach((t) => t.stop());
+      setError('No video track in the captured display stream.');
+      return;
+    }
+
+    // Remember the camera track so we can restore it on stop.
+    const currentCamTrack =
+      sender.track ?? localStream.getVideoTracks()[0] ?? null;
+    cameraVideoTrackRef.current = currentCamTrack;
+    screenStreamRef.current = display;
+
+    // Hot-swap on the existing sender. No renegotiation; the remote
+    // ontrack handler does NOT fire again — same MediaStreamTrack from
+    // their POV, just new frames.
+    try {
+      await sender.replaceTrack(screenTrack);
+    } catch (e: any) {
+      setError(`Could not start screen share: ${e?.message ?? e}`);
+      display.getTracks().forEach((t) => t.stop());
+      screenStreamRef.current = null;
+      cameraVideoTrackRef.current = null;
+      return;
+    }
+
+    // When the user clicks the browser-native "Stop sharing" pill,
+    // the track fires `ended` — flip our state back so the UI matches.
+    screenTrack.onended = () => {
+      void stopScreenShare();
+    };
+
+    setScreenOn(true);
+  }, [localStream, stopScreenShare]);
+
+  const toggleScreenShare = useCallback(async () => {
+    if (screenOn) {
+      await stopScreenShare();
+    } else {
+      await startScreenShare();
+    }
+  }, [screenOn, startScreenShare, stopScreenShare]);
 
   const sendChat = useCallback(
     async (text: string) => {
@@ -458,7 +591,7 @@ export function useWebRTC(): UseWebRTCResult {
     role,
     localStream,
     remote,
-    controls: { micOn, camOn, toggleMic, toggleCam },
+    controls: { micOn, camOn, screenOn, toggleMic, toggleCam, toggleScreenShare },
     chat,
     chatLoading,
     sendChat,
