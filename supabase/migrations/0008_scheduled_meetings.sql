@@ -196,13 +196,68 @@ grant execute on function public.cancel_scheduled_meeting(uuid) to authenticated
 -- have a FK to rooms.id. We still leave the host's membership row to
 -- be inserted by the regular Join flow's create_room_with_host call.
 
+-- 5a. Helper: insert a long-lived invite for a room. Pulled out of
+--     create_meeting_with_invite into its own function so that the
+--     `room_id` column reference lives in a relation scope that only
+--     contains `room_invites`. Inlining both INSERTs in one plpgsql
+--     body made `room_id` ambiguous between `room_members` and
+--     `room_invites` (both tables are touched in the function body,
+--     and the `INSERT INTO … AS alias` alias is not honored inside
+--     the INSERT's own column list).
+--
+--     Note: the OUT parameters are prefixed with `out_` so they don't
+--     collide with the column names on `room_invites` (notably
+--     `expires_at`). plpgsql would otherwise refuse with
+--     "column reference 'expires_at' is ambiguous" in the
+--     `returning token, expires_at` clause.
+drop function if exists public._insert_meeting_invite(text, uuid, timestamptz);
+create or replace function public._insert_meeting_invite(
+  p_room_id    text,
+  p_created_by uuid,
+  p_expires_at timestamptz
+) returns table (
+  out_invite_token text,
+  out_expires_at   timestamptz
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  return query
+    insert into public.room_invites (room_id, created_by, expires_at)
+    values (p_room_id, p_created_by, p_expires_at)
+    returning token, expires_at;
+end;
+$$;
+
+revoke all on function public._insert_meeting_invite(text, uuid, timestamptz) from public;
+grant execute on function public._insert_meeting_invite(text, uuid, timestamptz) to authenticated;
+
+-- Drop the old create_meeting_with_invite so we can re-create it with
+-- a renamed OUT parameter (`room_id` -> `room_slug`). Postgres
+-- refuses to change OUT-parameter names via CREATE OR REPLACE because
+-- the row type they define would change.
+drop function if exists public.create_meeting_with_invite(text, timestamptz, int);
+
+-- 5b. create_meeting_with_invite
+--
+-- Note: the OUT parameter is named `room_slug` (not `room_id`) so that
+-- the local function body has zero unqualified references to the
+-- string `room_id`. This is the cleanest way to avoid the "column
+-- reference 'room_id' is ambiguous" error that plpgsql raises when
+-- the function body references multiple tables that all have a
+-- `room_id` column (here: room_members, room_invites, scheduled_meetings).
+-- The client only consumes `meeting_id`, `invite_token`, and
+-- `expires_at`; the slug is re-fetched via a follow-up select on
+-- `scheduled_meetings`, so the rename is invisible to the client.
 create or replace function public.create_meeting_with_invite(
   p_title            text,
   p_scheduled_for    timestamptz,
   p_duration_minutes int default 30
 ) returns table (
   meeting_id    uuid,
-  room_id       text,
+  room_slug     text,
   invite_token  text,
   expires_at    timestamptz
 )
@@ -212,9 +267,15 @@ set search_path = public
 as $$
 declare
   v_uid     uuid := auth.uid();
-  v_meeting public.scheduled_meetings%rowtype;
+  -- Use `record` (not `public.scheduled_meetings%rowtype`) so that
+  -- `scheduled_meetings` does not enter the relation-resolution set
+  -- plpgsql uses to disambiguate column names in this function body.
+  v_meeting record;
+  v_meeting_id uuid;
+  v_meeting_slug text;
   v_expires timestamptz;
   v_token   text;
+  v_invite  record;
 begin
   if v_uid is null then
     raise exception 'not authenticated' using errcode = '42501';
@@ -223,17 +284,22 @@ begin
   v_meeting := public.create_scheduled_meeting(
     p_title, p_scheduled_for, p_duration_minutes
   );
+  v_meeting_id   := v_meeting.id;
+  v_meeting_slug := v_meeting.room_id;
 
   -- Create the rooms shell so the invite FK is satisfied.
   insert into public.rooms (id, created_by)
-  values (v_meeting.room_id, v_uid)
+  values (v_meeting_slug, v_uid)
   on conflict (id) do nothing;
 
   -- The host needs to be a member to satisfy is_room_host inside the
   -- invites INSERT policy. The Join flow will also call this; the
-  -- on-conflict makes it safe.
+  -- on-conflict makes it safe. Note the column list here is now
+  -- unambiguous: the only `room_id` in the function body's relation
+  -- set is `room_members.room_id` (rooms.id and the dropped rowtype
+  -- don't share the name).
   insert into public.room_members (room_id, user_id, role)
-  values (v_meeting.room_id, v_uid, 'host')
+  values (v_meeting_slug, v_uid, 'host')
   on conflict (room_id, user_id) do nothing;
 
   -- Default lifetime: scheduled start + duration + 1 hour grace.
@@ -241,12 +307,16 @@ begin
              + (p_duration_minutes || ' minutes')::interval
              + interval '1 hour';
 
-  insert into public.room_invites (room_id, created_by, expires_at)
-  values (v_meeting.room_id, v_uid, v_expires)
-  returning token, expires_at into v_token, v_expires;
+  -- The invite INSERT lives in its own function (see _insert_meeting_invite
+  -- above) so the `room_id` column reference isn't ambiguous with
+  -- `room_members.room_id` in the same plpgsql body.
+  select * into v_invite
+    from public._insert_meeting_invite(v_meeting_slug, v_uid, v_expires);
+  v_token   := v_invite.out_invite_token;
+  v_expires := v_invite.out_expires_at;
 
-  meeting_id   := v_meeting.id;
-  room_id      := v_meeting.room_id;
+  meeting_id   := v_meeting_id;
+  room_slug    := v_meeting_slug;
   invite_token := v_token;
   expires_at   := v_expires;
   return next;

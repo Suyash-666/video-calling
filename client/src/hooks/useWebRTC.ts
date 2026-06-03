@@ -152,8 +152,11 @@ async function waitForFirstVideoTrack(
     stream.onaddtrack = (ev) => {
       if (ev.track.kind === 'video') settle(ev.track);
     };
-    // Hard ceiling so callers never block forever on a misbehaving canvas.
-    window.setTimeout(() => settle(stream.getVideoTracks()[0] ?? null), 500);
+    // Hard ceiling so callers never block forever on a misbehaving
+    // canvas. captureStream(targetFps) won't emit a track until the
+    // first frame is drawn, which on first start can take 1-2s while
+    // the MediaPipe model loads + warms the WebGL backend.
+    window.setTimeout(() => settle(stream.getVideoTracks()[0] ?? null), 3000);
   });
 }
 
@@ -414,6 +417,13 @@ export function useWebRTC(): UseWebRTCResult {
           peersRef.current.get(payload.from) ??
           createPeerFor(payload.from, media);
         try {
+          // Guard against late / duplicate offers. setRemoteDescription
+          // with type=offer requires signalingState to be 'stable' or
+          // 'have-remote-offer' — anything else (e.g. we already
+          // negotiated) and the call throws. We drop silently because
+          // the existing connection is fine.
+          const s = entry.pc.signalingState;
+          if (s !== 'stable' && s !== 'have-remote-offer') return;
           await entry.pc.setRemoteDescription(
             new RTCSessionDescription(payload.sdp)
           );
@@ -438,6 +448,12 @@ export function useWebRTC(): UseWebRTCResult {
         const entry = peersRef.current.get(payload.from);
         if (!entry) return;
         try {
+          // setRemoteDescription with type=answer requires
+          // signalingState to be 'have-local-offer'. If a renegotiation
+          // already moved us to 'stable' (or another offer came in
+          // first), drop this stale answer instead of throwing
+          // "Called in wrong state: stable".
+          if (entry.pc.signalingState !== 'have-local-offer') return;
           await entry.pc.setRemoteDescription(
             new RTCSessionDescription(payload.sdp)
           );
@@ -1106,12 +1122,67 @@ export function useWebRTC(): UseWebRTCResult {
     joinedAtRef.current = 0;
   }, [bumpPeerTick, role, stopRecordingInternal]);
 
+  // Keep a ref to the latest hangUp so the page-hide listener below
+  // can call it without capturing a stale closure (and without
+  // re-registering the listener every render).
+  const hangUpRef = useRef(hangUp);
+  useEffect(() => {
+    hangUpRef.current = hangUp;
+  }, [hangUp]);
+
   useEffect(() => {
     return () => {
       hangUp();
       supabase.removeAllChannels();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Tab-close / navigation cleanup. The React unmount effect above
+  // doesn't run reliably on a hard tab close — the browser may destroy
+  // the page before React gets a chance. pagehide + beforeunload fire
+  // synchronously while we still have access to the DOM, so we can
+  // stop camera/mic tracks and close peer connections here. Without
+  // this, the camera LED can stay lit for a few seconds after the tab
+  // closes on some platforms (the device handle outlives the JS
+  // process until the OS reaps it).
+  useEffect(() => {
+    const onPageHide = () => {
+      // Synchronous, best-effort. We deliberately do NOT use a Promise
+      // here — pagehide handlers have a tight time budget and the
+      // browser won't wait for an awaited teardown.
+      try {
+        const local = localStreamRef.current;
+        if (local) local.getTracks().forEach((t) => t.stop());
+        const screen = screenStreamRef.current;
+        if (screen) screen.getTracks().forEach((t) => t.stop());
+        for (const entry of peersRef.current.values()) {
+          try {
+            entry.pc.close();
+          } catch {
+            /* already closed */
+          }
+        }
+        try {
+          channelRef.current?.unsubscribe();
+        } catch {
+          /* ignore */
+        }
+        try {
+          supabase.removeAllChannels();
+        } catch {
+          /* ignore */
+        }
+      } catch {
+        /* best effort */
+      }
+    };
+    window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('beforeunload', onPageHide);
+    return () => {
+      window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('beforeunload', onPageHide);
+    };
   }, []);
 
   // --- Controls + chat send -------------------------------------------------
@@ -1296,7 +1367,12 @@ export function useWebRTC(): UseWebRTCResult {
     const blurred = await blur.start();
     const blurredTrack = await waitForFirstVideoTrack(blurred);
     if (!blurredTrack) {
+      // blur.start() already set the hook's enabled=true. Tear it back
+      // down so the user can re-toggle without being stuck in a
+      // half-on state where their own preview is fine but peers see
+      // no track.
       setError('Background blur failed to produce a video track.');
+      blur.stop();
       return;
     }
     for (const entry of peersRef.current.values()) {
