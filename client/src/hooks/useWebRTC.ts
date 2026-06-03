@@ -1,31 +1,55 @@
 // hooks/useWebRTC.ts
 // The whole WebRTC dance lives in this single hook so the UI stays declarative.
-// High-level flow:
+// High-level flow (full mesh, up to MAX_PARTICIPANTS):
 //   1. Ask the browser for camera + mic (getUserMedia).
 //   2. Open a Supabase Realtime channel and "join" a room by subscribing.
-//   3. Use Realtime presence to figure out who else is in the room.
-//      Whoever is the second person in the room creates a WebRTC offer.
-//   4. The first person answers, and they exchange ICE candidates.
-//   5. The browser establishes a direct peer connection — media flows P2P,
-//      the server is not in the media path. (Supabase Realtime is the
-//      signaling channel only; no media touches Supabase.)
+//   3. Presence tells us who else is in the room. For every other peer we
+//      open a *separate* RTCPeerConnection. Whichever side has the
+//      lexicographically smaller user id sends the offer (the same rule
+//      that fixed glare in the 1:1 version, now applied per pair).
+//   4. Offers / answers / ICE candidates are broadcast on the same channel
+//      but carry `from` + `to` fields so peers route messages by addressee
+//      and ignore everything else.
+//   5. The browser establishes each direct peer connection — media flows
+//      P2P, the server is not in the media path. (Supabase Realtime is
+//      the signaling channel only; no media touches Supabase.)
+//
+// Presence also carries live UI state for each peer: display name,
+// host flag, mic / cam on/off, raise-hand. Toggling any of those calls
+// `ch.track(...)` with the new payload, and every peer's presence-sync
+// rebuilds the participants list. That's how the sidebar stays real-time
+// without a dedicated channel per feature.
+//
+// Lightweight room events use broadcast (no DB write):
+//   - `reaction`     : transient floating emoji over a tile (3s ttl)
+//   - `lower-hands`  : host instructs everyone to drop their hand
 //
 // Chat is persisted:
 //   - On join: SELECT the last N messages for the room from `public.messages`.
 //   - On send: INSERT a row. The author's `user_id` is set by RLS via auth.uid().
-//   - Realtime: subscribe to `postgres_changes` filtered by room_id so that
-//     inserts from the peer (and from other tabs of the same user) appear
-//     instantly without us needing a separate broadcast path.
+//   - Realtime: subscribe to `postgres_changes` filtered by room_id.
 //
-// Auth: the Supabase JS client automatically attaches the current user's
-// access token to Realtime WebSocket connections, so when Realtime is
-// configured to require authentication (see supabase/migrations/0001_*.sql
-// in the repo), anonymous subscribers are rejected by the server.
+// Recording is *local*: a MediaRecorder over a combined MediaStream made
+// from the local video sender's current track (so screen share is captured
+// for free) plus every audio track in the room (mic + every remote audio),
+// mixed via a single AudioContext destination node. On stop, the WebM blob
+// is downloaded via an anchor click. Nothing leaves the user's machine.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { roomChannel, supabase } from '../lib/supabase';
 import { useAuth } from '../lib/auth';
-import type { ChatMessage, UseWebRTCResult } from '../types';
+import { useBackgroundBlur } from './useBackgroundBlur';
+import {
+  MAX_PARTICIPANTS,
+  type ChatMessage,
+  type Participant,
+  type PendingRequest,
+  type Reaction,
+  type ReactionEmoji,
+  type RecordingControls,
+  type UseWebRTCResult,
+  type WaitingState,
+} from '../types';
 import type { RealtimeChannel } from '@supabase/supabase-js';
 
 // Public STUN servers. They help two peers discover their public IP/port
@@ -34,82 +58,177 @@ const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
 ];
 
-// How many historical messages to load when joining a room.
 const HISTORY_LIMIT = 50;
+const REACTION_TTL_MS = 3000;
+
+// Shape of one presence row, as we publish it via ch.track(...).
+interface PresenceRow {
+  id: string;
+  name: string;
+  isHost: boolean;
+  micOn: boolean;
+  camOn: boolean;
+  handRaised: boolean;
+  joinedAt: number;
+}
+
+// Per-peer mutable WebRTC state. One PeerEntry per remote participant.
+interface PeerEntry {
+  pc: RTCPeerConnection;
+  videoSender: RTCRtpSender | null;
+  remoteStream: MediaStream;
+  hasMedia: boolean;
+  connectionState: RTCPeerConnectionState;
+}
 
 // How the user is joining a room, used to choose the right RPC.
-//   'host'  -> create the room + add ourselves as host
-//   'guest' -> redeem an invite token
+// Returns the new join-request id when the host's room has waiting room
+// enabled (guest must wait for approval before re-joining), or null when
+// membership was granted directly (the host path or a no-waiting-room
+// guest path).
 async function joinRoomRpc(
   room: string,
   mode: 'host' | 'guest',
   inviteToken?: string
-): Promise<void> {
+): Promise<string | null> {
   if (mode === 'host') {
     const { error } = await supabase.rpc('create_room_with_host', {
       p_room_id: room,
     });
     if (error) throw new Error(error.message);
-    return;
+    return null;
   }
-  // mode === 'guest'
   if (!inviteToken) {
     throw new Error('An invite token is required to join a private room.');
   }
-  const { error } = await supabase.rpc('redeem_invite', {
+  const { data, error } = await supabase.rpc('redeem_invite', {
     p_room_id: room,
     p_token: inviteToken,
   });
   if (error) throw new Error(error.message);
+  // redeem_invite returns the request id when waiting room is enabled,
+  // null otherwise (membership granted directly).
+  return (data as string | null) ?? null;
+}
+
+// Best-effort display name from a Supabase user. Email local-part > id slug.
+function displayNameFor(
+  user: { email?: string | null; id: string } | null
+): string {
+  if (!user) return 'You';
+  if (user.email) {
+    const at = user.email.indexOf('@');
+    return at > 0 ? user.email.slice(0, at) : user.email;
+  }
+  return user.id.slice(0, 6);
+}
+
+// crypto.randomUUID is the cleanest portable id generator; the lib types
+// in older TS may not surface it on `Crypto`, so we cast pragmatically.
+function uuid(): string {
+  return (crypto as any).randomUUID
+    ? (crypto as any).randomUUID()
+    : Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+// canvas.captureStream() returns a MediaStream whose tracks may not yet
+// be populated by the time it returns — the canvas needs at least one
+// frame composited first. This helper waits up to ~500ms for a video
+// track to appear. Used by the background-blur swap so we don't try to
+// replaceTrack(null).
+async function waitForFirstVideoTrack(
+  stream: MediaStream | null
+): Promise<MediaStreamTrack | null> {
+  if (!stream) return null;
+  const existing = stream.getVideoTracks()[0];
+  if (existing) return existing;
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (t: MediaStreamTrack | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(t);
+    };
+    stream.onaddtrack = (ev) => {
+      if (ev.track.kind === 'video') settle(ev.track);
+    };
+    // Hard ceiling so callers never block forever on a misbehaving canvas.
+    window.setTimeout(() => settle(stream.getVideoTracks()[0] ?? null), 500);
+  });
 }
 
 export function useWebRTC(): UseWebRTCResult {
   const { user } = useAuth();
   const selfId = user?.id ?? '';
+  const selfName = useMemo(() => displayNameFor(user), [user]);
 
   const [status, setStatus] = useState<UseWebRTCResult['status']>('idle');
   const [error, setError] = useState<string | null>(null);
   const [roomId, setRoomId] = useState<string | null>(null);
   const [role, setRole] = useState<UseWebRTCResult['role']>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const [remote, setRemote] = useState<UseWebRTCResult['remote']>({
-    hasRemote: false,
-    remoteStream: null,
-  });
+  // The presence-derived view of remote peers. We merge this with WebRTC
+  // state when building the public `participants` array.
+  const [presenceRows, setPresenceRows] = useState<PresenceRow[]>([]);
+  // Tick that increments whenever a PeerEntry mutates (track arrived,
+  // connection state changed). The participants useMemo reads this so
+  // React knows to recompute even though peersRef is a ref.
+  const [peerTick, setPeerTick] = useState(0);
+  const bumpPeerTick = useCallback(() => setPeerTick((n) => n + 1), []);
   const [micOn, setMicOn] = useState(true);
   const [camOn, setCamOn] = useState(true);
+  const [handRaised, setHandRaised] = useState(false);
   const [screenOn, setScreenOn] = useState(false);
+  const [reactions, setReactions] = useState<Reaction[]>([]);
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
 
-  // Refs hold mutable WebRTC + channel objects outside React's render cycle.
-  const pcRef = useRef<RTCPeerConnection | null>(null);
+  // Recording state.
+  const [isRecording, setIsRecording] = useState(false);
+  const [elapsedSec, setElapsedSec] = useState(0);
+
+  // --- Waiting room state ---------------------------------------------------
+  // Guest side: non-null while we're waiting for the host to approve us.
+  const [waiting, setWaiting] = useState<WaitingState | null>(null);
+  // Host side: live list of pending requests for the current room.
+  const [pendingRequests, setPendingRequests] = useState<PendingRequest[]>([]);
+  // Mirrored copy of public.rooms.waiting_room_enabled for the current room.
+  const [waitingRoomEnabled, setWaitingRoomEnabledState] = useState(false);
+
+  // --- Refs (mutable state outside the React tree) --------------------------
   const channelRef = useRef<RealtimeChannel | null>(null);
   const roomIdRef = useRef<string | null>(null);
-  // The single video RTCRtpSender we use for both the camera track and
-  // the screen-share track. Grabbing it once at peer-creation time lets
-  // us swap tracks via `replaceTrack()` — no SDP renegotiation needed,
-  // because the transceiver/m-line is reused.
-  const videoSenderRef = useRef<RTCRtpSender | null>(null);
-  // The original camera track we displaced when starting a screen share.
-  // We keep a reference so we can put it back when screen share ends,
-  // without having to re-call getUserMedia (faster + no permission re-prompt).
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const peersRef = useRef<Map<string, PeerEntry>>(new Map());
   const cameraVideoTrackRef = useRef<MediaStreamTrack | null>(null);
-  // The screen-capture stream we're currently broadcasting, if any.
-  // Held so we can stop *all* its tracks (incl. system audio if the
-  // user opted in) on toggle-off / hang-up.
   const screenStreamRef = useRef<MediaStream | null>(null);
 
-  // A single MediaStream we own that accumulates incoming remote tracks.
-  // `ontrack` fires once per track (audio + video). Using `ev.streams[0]`
-  // can give us a stream whose tracks aren't all attached yet at the
-  // moment we hand it to <video srcObject>, especially on the first fire.
-  // We build our own stream and add tracks as they arrive — the video
-  // element sees the new track and starts rendering it.
-  const remoteStreamRef = useRef<MediaStream | null>(null);
+  // Recording refs: held outside state so the start/stop callbacks aren't
+  // recreated on every elapsedSec tick.
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const recordingMixCtxRef = useRef<AudioContext | null>(null);
+  const recordingStartedAtRef = useRef<number>(0);
+  const recordingTimerRef = useRef<number | null>(null);
 
-  // --- WebRTC plumbing (unchanged) ------------------------------------------
+  // Waiting-room realtime subscriptions. We keep the channel handles so
+  // hangUp / cancelWaiting can unsubscribe explicitly instead of relying
+  // on supabase.removeAllChannels (which would also nuke the chat channel).
+  const requestsChannelRef = useRef<RealtimeChannel | null>(null);
 
+  // --- Analytics tracking refs ----------------------------------------------
+  // The host (and only the host) accumulates per-call telemetry while
+  // in-call and ships it to public.record_call_session on hangUp. We
+  // keep everything in refs so updates don't trigger re-renders.
+  const callStartedAtRef = useRef<number | null>(null);
+  const peakParticipantsRef = useRef<number>(0);
+  const messageCountRef = useRef<number>(0);
+  // Per-user join/leave timestamps. Keyed by user_id.
+  const analyticsPeersRef = useRef<
+    Map<string, { name: string | null; joinedAt: number; leftAt: number | null }>
+  >(new Map());
+
+  // --- Local media ----------------------------------------------------------
   const startLocalMedia = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -117,6 +236,7 @@ export function useWebRTC(): UseWebRTCResult {
         audio: true,
       });
       setLocalStream(stream);
+      localStreamRef.current = stream;
       return stream;
     } catch (e: any) {
       setError(`Could not access camera/mic: ${e?.message ?? e}`);
@@ -125,96 +245,216 @@ export function useWebRTC(): UseWebRTCResult {
     }
   }, []);
 
-  const createPeer = useCallback((stream: MediaStream) => {
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    pcRef.current = pc;
+  // --- Signaling envelope ---------------------------------------------------
+  const sendSignal = useCallback(
+    (
+      event: 'offer' | 'answer' | 'ice-candidate',
+      to: string,
+      payload: Record<string, unknown>
+    ) => {
+      const ch = channelRef.current;
+      if (!ch) return;
+      ch.send({
+        type: 'broadcast',
+        event,
+        payload: { from: selfId, to, ...payload },
+      });
+    },
+    [selfId]
+  );
 
-    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+  // --- Peer connection lifecycle -------------------------------------------
+  const createPeerFor = useCallback(
+    (peerId: string, localMedia: MediaStream): PeerEntry => {
+      const existing = peersRef.current.get(peerId);
+      if (existing) return existing;
 
-    // Cache the video sender now so screen-share can swap its track
-    // later via replaceTrack() (no renegotiation needed).
-    videoSenderRef.current =
-      pc.getSenders().find((s) => s.track?.kind === 'video') ?? null;
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-    // Fresh remote stream for this peer connection. We hold it in a ref
-    // (stable identity) AND mirror it into state so VideoTile re-renders
-    // when the first track arrives. After that, both tracks land on the
-    // SAME MediaStream — the <video> element picks up the second one
-    // automatically without React needing to re-attach srcObject.
-    const remoteStream = new MediaStream();
-    remoteStreamRef.current = remoteStream;
-    setRemote({ hasRemote: false, remoteStream });
+      let videoSender: RTCRtpSender | null = null;
+      localMedia.getTracks().forEach((track) => {
+        const sender = pc.addTrack(track, localMedia);
+        if (track.kind === 'video') videoSender = sender;
+      });
 
-    pc.ontrack = (ev) => {
-      const target = remoteStreamRef.current;
-      if (!target) return;
-      // De-dupe: addTrack on a stream that already has the track is a
-      // silent no-op in spec, but being explicit keeps the intent clear.
-      if (!target.getTracks().some((t) => t.id === ev.track.id)) {
-        target.addTrack(ev.track);
-      }
-      // When the remote ends a track (e.g. they hangup mid-call), drop
-      // it so we don't keep a dead track in the stream.
-      ev.track.onended = () => {
-        target.removeTrack(ev.track);
+      const remoteStream = new MediaStream();
+
+      const entry: PeerEntry = {
+        pc,
+        videoSender,
+        remoteStream,
+        hasMedia: false,
+        connectionState: pc.connectionState,
       };
-      setRemote({ hasRemote: true, remoteStream: target });
-    };
+      peersRef.current.set(peerId, entry);
 
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate && channelRef.current) {
-        channelRef.current.send({
-          type: 'broadcast',
-          event: 'ice-candidate',
-          payload: { candidate: ev.candidate.toJSON() },
-        });
+      pc.ontrack = (ev) => {
+        const e = peersRef.current.get(peerId);
+        if (!e) return;
+        if (!e.remoteStream.getTracks().some((t) => t.id === ev.track.id)) {
+          e.remoteStream.addTrack(ev.track);
+        }
+        ev.track.onended = () => {
+          e.remoteStream.removeTrack(ev.track);
+          bumpPeerTick();
+        };
+        e.hasMedia = true;
+        bumpPeerTick();
+      };
+
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          sendSignal('ice-candidate', peerId, {
+            candidate: ev.candidate.toJSON(),
+          });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        const e = peersRef.current.get(peerId);
+        if (!e) return;
+        e.connectionState = pc.connectionState;
+        bumpPeerTick();
+      };
+
+      bumpPeerTick();
+      return entry;
+    },
+    [sendSignal, bumpPeerTick]
+  );
+
+  const removePeer = useCallback(
+    (peerId: string) => {
+      const entry = peersRef.current.get(peerId);
+      if (!entry) return;
+      try {
+        // Closing the PC tears down its senders/receivers. Local tracks
+        // live on localStream and must not be stopped here — other peers
+        // are still sending them.
+        entry.pc.close();
+      } catch {
+        /* already closed */
       }
-    };
+      entry.remoteStream.getTracks().forEach((t) => {
+        entry.remoteStream.removeTrack(t);
+      });
+      peersRef.current.delete(peerId);
+      bumpPeerTick();
+    },
+    [bumpPeerTick]
+  );
 
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        setError(`Connection ${pc.connectionState}`);
+  const callPeer = useCallback(
+    async (peerId: string) => {
+      const entry = peersRef.current.get(peerId);
+      if (!entry) return;
+      try {
+        const offer = await entry.pc.createOffer();
+        await entry.pc.setLocalDescription(offer);
+        sendSignal('offer', peerId, { sdp: offer });
+      } catch (e: any) {
+        setError(`Failed to call ${peerId.slice(0, 6)}: ${e?.message ?? e}`);
       }
-    };
+    },
+    [sendSignal]
+  );
 
-    return pc;
-  }, []);
-
-  const startCall = useCallback(async () => {
-    const pc = pcRef.current;
+  // --- Presence republish ---------------------------------------------------
+  // Any time our public flags change (mic/cam/hand/role), rewrite our
+  // presence row. Every other peer's presence-sync fires and rebuilds
+  // their sidebar without us needing a side channel.
+  const publishPresence = useCallback(async () => {
     const ch = channelRef.current;
-    if (!pc || !ch) return;
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    ch.send({ type: 'broadcast', event: 'offer', payload: { sdp: offer } });
-  }, []);
+    if (!ch || !selfId) return;
+    const row: PresenceRow = {
+      id: selfId,
+      name: selfName,
+      isHost: role === 'host',
+      micOn,
+      camOn,
+      handRaised,
+      joinedAt: Date.now(),
+    };
+    try {
+      await ch.track(row);
+    } catch {
+      /* benign on rapid toggle */
+    }
+  }, [selfId, selfName, role, micOn, camOn, handRaised]);
 
+  // Republish whenever any tracked flag changes (after the initial track
+  // in joinRoom has run — channelRef will be non-null at that point).
+  useEffect(() => {
+    void publishPresence();
+  }, [publishPresence]);
+
+  // --- Signaling + presence handlers ---------------------------------------
   const attachSignaling = useCallback(
     (ch: RealtimeChannel) => {
-      const onOffer = async ({ payload }: { payload: { sdp: RTCSessionDescriptionInit } }) => {
-        const pc = pcRef.current;
-        if (!pc) return;
-        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        ch.send({ type: 'broadcast', event: 'answer', payload: { sdp: answer } });
-      };
-
-      const onAnswer = async ({ payload }: { payload: { sdp: RTCSessionDescriptionInit } }) => {
-        const pc = pcRef.current;
-        if (!pc) return;
-        await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-        setStatus('in-call');
-      };
-
-      const onIce = async ({ payload }: { payload: { candidate: RTCIceCandidateInit } }) => {
-        const pc = pcRef.current;
-        if (!pc) return;
+      const onOffer = async ({
+        payload,
+      }: {
+        payload: {
+          from: string;
+          to: string;
+          sdp: RTCSessionDescriptionInit;
+        };
+      }) => {
+        if (payload.to !== selfId || payload.from === selfId) return;
+        const media = localStreamRef.current;
+        if (!media) return;
+        const entry =
+          peersRef.current.get(payload.from) ??
+          createPeerFor(payload.from, media);
         try {
-          await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+          await entry.pc.setRemoteDescription(
+            new RTCSessionDescription(payload.sdp)
+          );
+          const answer = await entry.pc.createAnswer();
+          await entry.pc.setLocalDescription(answer);
+          sendSignal('answer', payload.from, { sdp: answer });
+        } catch (e: any) {
+          setError(`Offer handling failed: ${e?.message ?? e}`);
+        }
+      };
+
+      const onAnswer = async ({
+        payload,
+      }: {
+        payload: {
+          from: string;
+          to: string;
+          sdp: RTCSessionDescriptionInit;
+        };
+      }) => {
+        if (payload.to !== selfId || payload.from === selfId) return;
+        const entry = peersRef.current.get(payload.from);
+        if (!entry) return;
+        try {
+          await entry.pc.setRemoteDescription(
+            new RTCSessionDescription(payload.sdp)
+          );
+        } catch (e: any) {
+          setError(`Answer handling failed: ${e?.message ?? e}`);
+        }
+      };
+
+      const onIce = async ({
+        payload,
+      }: {
+        payload: {
+          from: string;
+          to: string;
+          candidate: RTCIceCandidateInit;
+        };
+      }) => {
+        if (payload.to !== selfId || payload.from === selfId) return;
+        const entry = peersRef.current.get(payload.from);
+        if (!entry) return;
+        try {
+          await entry.pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
         } catch {
-          // Benign: candidates can arrive before remote description is set
-          // in some browsers. The next candidate event will usually fix it.
+          /* benign — see comment in 1:1 version */
         }
       };
 
@@ -222,92 +462,168 @@ export function useWebRTC(): UseWebRTCResult {
       ch.on('broadcast', { event: 'answer' }, onAnswer as any);
       ch.on('broadcast', { event: 'ice-candidate' }, onIce as any);
 
-      // Presence: when both sides are tracked, decide who's the caller.
-      // We need a *deterministic* rule so exactly one peer initiates.
-      // Without this, both peers' presence-sync fires when the second
-      // joins, both see the other as "remote", both have localDescription
-      // === null, and both call startCall() — i.e. "glare". The two offers
-      // then collide in have-local-offer state and the negotiation fails,
-      // which is why chat works but video never connects.
-      //
-      // Rule: the peer with the lexicographically smaller user id is the
-      // caller. Same rule on both sides => exactly one offer.
+      // --- Lightweight room events ---------------------------------------
+
+      ch.on(
+        'broadcast',
+        { event: 'reaction' },
+        ({
+          payload,
+        }: {
+          payload: { from: string; emoji: ReactionEmoji; at: number };
+        }) => {
+          // Defend against unknown emojis from a future client version.
+          if (!payload?.emoji) return;
+          const r: Reaction = {
+            id: uuid(),
+            from: payload.from,
+            emoji: payload.emoji,
+            at: payload.at ?? Date.now(),
+          };
+          setReactions((prev) => [...prev, r]);
+          // Auto-prune after TTL. We schedule a single timer per reaction;
+          // cheap because the list itself is tiny.
+          window.setTimeout(() => {
+            setReactions((prev) => prev.filter((x) => x.id !== r.id));
+          }, REACTION_TTL_MS);
+        }
+      );
+
+      ch.on(
+        'broadcast',
+        { event: 'lower-hands' },
+        ({ payload }: { payload: { from: string } }) => {
+          // Honor the instruction only if the sender is the room's host
+          // *according to the current presence snapshot*. This means a
+          // non-host can't fake the message just by inspecting the network.
+          const state = ch.presenceState();
+          const all = Object.values(state).flat() as unknown as PresenceRow[];
+          const sender = all.find((p) => p?.id === payload.from);
+          if (!sender?.isHost) return;
+          setHandRaised(false);
+        }
+      );
+
+      // --- Presence -------------------------------------------------------
+
       ch.on('presence', { event: 'sync' }, () => {
         const state = ch.presenceState();
-        const others = (Object.values(state).flat() as Array<{ id?: string }>)
-          .filter((p) => p?.id && p.id !== selfId);
-        if (others.length === 0) return;
-        const peerId = others[0].id as string;
-        const iAmCaller = selfId < peerId;
-        if (iAmCaller && pcRef.current && !pcRef.current.localDescription) {
-          startCall();
+        const rows: PresenceRow[] = (
+          Object.values(state).flat() as unknown as PresenceRow[]
+        ).filter((r) => r?.id);
+
+        // Soft capacity check.
+        if (rows.length > MAX_PARTICIPANTS) {
+          setError(
+            `Room is over capacity (${rows.length}/${MAX_PARTICIPANTS}). New peers may not connect.`
+          );
+        }
+
+        setPresenceRows(rows);
+
+        // Analytics: track peak participants and join times. Only the
+        // host writes analytics, but we accumulate on every client (cheap;
+        // refs only) so the host-vs-guest branch lives in one place.
+        if (rows.length > peakParticipantsRef.current) {
+          peakParticipantsRef.current = rows.length;
+        }
+        for (const r of rows) {
+          if (!analyticsPeersRef.current.has(r.id)) {
+            analyticsPeersRef.current.set(r.id, {
+              name: r.name ?? null,
+              joinedAt: r.joinedAt ?? Date.now(),
+              leftAt: null,
+            });
+          }
+        }
+
+        // Mesh reconciliation.
+        const presentIds = new Set(
+          rows.map((r) => r.id).filter((id) => id !== selfId)
+        );
+        const media = localStreamRef.current;
+        if (!media) return;
+
+        for (const existingId of Array.from(peersRef.current.keys())) {
+          if (!presentIds.has(existingId)) removePeer(existingId);
+        }
+        for (const peerId of presentIds) {
+          if (peersRef.current.has(peerId)) continue;
+          createPeerFor(peerId, media);
+          if (selfId < peerId) void callPeer(peerId);
         }
       });
 
-      ch.on('presence', { event: 'leave' }, () => {
-        // Drop any tracks the peer was sending and reset to "waiting".
-        remoteStreamRef.current?.getTracks().forEach((t) => {
-          remoteStreamRef.current!.removeTrack(t);
+      ch.on('presence', { event: 'leave' }, ({ leftPresences }) => {
+        const arr = (leftPresences ?? []) as unknown as PresenceRow[];
+        arr.forEach((p) => {
+          if (!p?.id || p.id === selfId) return;
+          // Analytics: stamp the leave time so the dashboard can show
+          // attendance windows per participant.
+          const a = analyticsPeersRef.current.get(p.id);
+          if (a && a.leftAt === null) {
+            a.leftAt = Date.now();
+          }
+          removePeer(p.id);
+          setChat((prev) => [
+            ...prev,
+            {
+              id: `sys-${Date.now()}-${p.id}`,
+              userId: 'system',
+              from: 'peer',
+              text: `${p.name ?? p.id.slice(0, 6)} left`,
+              at: Date.now(),
+            },
+          ]);
         });
-        setRemote({ hasRemote: false, remoteStream: null });
-        setChat((prev) => [
-          ...prev,
-          {
-            id: `sys-${Date.now()}`,
-            userId: 'system',
-            from: 'peer',
-            text: '(peer left)',
-            at: Date.now(),
-          },
-        ]);
       });
     },
-    [startCall, selfId]
+    [callPeer, createPeerFor, removePeer, selfId, sendSignal]
   );
 
   // --- Chat history ---------------------------------------------------------
-
-  // Load the last N messages for a room. RLS limits what we can see.
-  const loadHistory = useCallback(async (room: string) => {
-    setChatLoading(true);
-    try {
-      const { data, error: err } = await supabase
-        .from('messages')
-        .select('id, user_id, text, created_at')
-        .eq('room_id', room)
-        .order('created_at', { ascending: false })
-        .limit(HISTORY_LIMIT);
-      if (err) {
-        setError(`Could not load chat history: ${err.message}`);
-        return;
+  const loadHistory = useCallback(
+    async (room: string) => {
+      setChatLoading(true);
+      try {
+        const { data, error: err } = await supabase
+          .from('messages')
+          .select('id, user_id, text, created_at')
+          .eq('room_id', room)
+          .order('created_at', { ascending: false })
+          .limit(HISTORY_LIMIT);
+        if (err) {
+          setError(`Could not load chat history: ${err.message}`);
+          return;
+        }
+        const rows = (data ?? []).slice().reverse();
+        const mapped: ChatMessage[] = rows.map((r: any) => ({
+          id: r.id,
+          userId: r.user_id,
+          from: r.user_id === selfId ? 'me' : 'peer',
+          text: r.text,
+          at: new Date(r.created_at).getTime(),
+        }));
+        setChat(mapped);
+      } finally {
+        setChatLoading(false);
       }
-      // Reverse so the panel shows oldest-first.
-      const rows = (data ?? []).slice().reverse();
-      const mapped: ChatMessage[] = rows.map((r: any) => ({
-        id: r.id,
-        userId: r.user_id,
-        from: r.user_id === selfId ? 'me' : 'peer',
-        text: r.text,
-        at: new Date(r.created_at).getTime(),
-      }));
-      setChat(mapped);
-    } finally {
-      setChatLoading(false);
-    }
-  }, [selfId]);
+    },
+    [selfId]
+  );
 
-  // Subscribe to new inserts on the messages table for this room.
-  // We use a *separate* channel from the signaling one, because the
-  // channel-level filter syntax differs and we want them with
-  // different lifecycles (chat outlives the WebRTC handshake on
-  // hang up if you ever change your mind about that).
   const attachChatSubscription = useCallback(
     (room: string) => {
       const ch = supabase
         .channel(`messages:${room}`)
         .on(
           'postgres_changes',
-          { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_id=eq.${room}` },
+          {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'messages',
+            filter: `room_id=eq.${room}`,
+          },
           (payload) => {
             const row: any = payload.new;
             const msg: ChatMessage = {
@@ -318,9 +634,11 @@ export function useWebRTC(): UseWebRTCResult {
               at: new Date(row.created_at).getTime(),
             };
             setChat((prev) => {
-              // Dedupe: an INSERT for a message we just sent will echo
-              // back. If we already have a row with this id, skip.
               if (prev.some((m) => m.id === msg.id)) return prev;
+              // Analytics: count every unique inbound message exactly once.
+              // Sender-side count happens here too because postgres_changes
+              // echoes our own INSERTs back.
+              messageCountRef.current += 1;
               return [...prev, msg];
             });
           }
@@ -333,11 +651,199 @@ export function useWebRTC(): UseWebRTCResult {
 
   // --- Room lifecycle -------------------------------------------------------
 
+  // Internal: everything we do AFTER membership exists in room_members.
+  // Split out from joinRoom so the waiting-room "approved" callback can
+  // call this without re-doing the RPC dance.
+  const enterRoomAfterMembership = useCallback(
+    async (id: string, mode: 'host' | 'guest') => {
+      setRole(mode);
+
+      await startLocalMedia();
+      const ch = roomChannel(id);
+      attachSignaling(ch);
+      channelRef.current = ch;
+
+      await new Promise<void>((resolve, reject) => {
+        ch.subscribe(async (subStatus) => {
+          if (subStatus === 'SUBSCRIBED') {
+            await ch.track({
+              id: selfId,
+              name: selfName,
+              isHost: mode === 'host',
+              micOn: true,
+              camOn: true,
+              handRaised: false,
+              joinedAt: Date.now(),
+            } satisfies PresenceRow);
+            setStatus('in-call');
+            // Analytics: stamp the call's start time and seed our own
+            // participant record. Host-only — guests don't write sessions.
+            if (mode === 'host') {
+              callStartedAtRef.current = Date.now();
+              analyticsPeersRef.current.clear();
+              peakParticipantsRef.current = 1;
+              messageCountRef.current = 0;
+              analyticsPeersRef.current.set(selfId, {
+                name: selfName,
+                joinedAt: Date.now(),
+                leftAt: null,
+              });
+            }
+            resolve();
+          } else if (
+            subStatus === 'CHANNEL_ERROR' ||
+            subStatus === 'TIMED_OUT' ||
+            subStatus === 'CLOSED'
+          ) {
+            reject(new Error(`Channel status: ${subStatus}`));
+          }
+        });
+      });
+
+      await loadHistory(id);
+      attachChatSubscription(id);
+
+      // Load the room's waiting-room flag so the host UI can render the
+      // toggle in the correct state. RLS lets members SELECT the row.
+      const { data: roomRow } = await supabase
+        .from('rooms')
+        .select('waiting_room_enabled')
+        .eq('id', id)
+        .maybeSingle();
+      setWaitingRoomEnabledState(!!roomRow?.waiting_room_enabled);
+
+      // Host-only: subscribe to incoming join requests and prime with any
+      // already-pending rows. Guests do not need this stream.
+      if (mode === 'host') {
+        const { data: rows } = await supabase
+          .from('room_join_requests')
+          .select('id, user_id, display_name, status, created_at')
+          .eq('room_id', id)
+          .eq('status', 'pending')
+          .order('created_at', { ascending: true });
+        setPendingRequests(
+          (rows ?? []).map((r: any) => ({
+            id: r.id,
+            userId: r.user_id,
+            displayName: r.display_name ?? null,
+            createdAt: new Date(r.created_at).getTime(),
+            status: r.status,
+          }))
+        );
+
+        const reqCh = supabase
+          .channel(`requests:${id}`)
+          .on(
+            'postgres_changes',
+            {
+              event: 'INSERT',
+              schema: 'public',
+              table: 'room_join_requests',
+              filter: `room_id=eq.${id}`,
+            },
+            (payload) => {
+              const r: any = payload.new;
+              if (r.status !== 'pending') return;
+              setPendingRequests((prev) =>
+                prev.some((x) => x.id === r.id)
+                  ? prev
+                  : [
+                      ...prev,
+                      {
+                        id: r.id,
+                        userId: r.user_id,
+                        displayName: r.display_name ?? null,
+                        createdAt: new Date(r.created_at).getTime(),
+                        status: 'pending',
+                      },
+                    ]
+              );
+            }
+          )
+          .on(
+            'postgres_changes',
+            {
+              event: 'UPDATE',
+              schema: 'public',
+              table: 'room_join_requests',
+              filter: `room_id=eq.${id}`,
+            },
+            (payload) => {
+              const r: any = payload.new;
+              // Anything that's no longer pending leaves the inbox.
+              setPendingRequests((prev) =>
+                prev.filter((x) => x.id !== r.id)
+              );
+            }
+          )
+          .subscribe();
+        requestsChannelRef.current = reqCh;
+      }
+    },
+    [
+      attachChatSubscription,
+      attachSignaling,
+      loadHistory,
+      startLocalMedia,
+      selfId,
+      selfName,
+    ]
+  );
+
+  // Guest helper: subscribe to OUR OWN request row and unblock when the
+  // host flips `status` to 'approved' (or surface a rejection).
+  const watchOwnRequest = useCallback(
+    (requestId: string, roomIdArg: string, token: string) => {
+      const ch = supabase
+        .channel(`my-request:${requestId}`)
+        .on(
+          'postgres_changes',
+          {
+            event: 'UPDATE',
+            schema: 'public',
+            table: 'room_join_requests',
+            filter: `id=eq.${requestId}`,
+          },
+          async (payload) => {
+            const r: any = payload.new;
+            if (r.status === 'approved') {
+              // Tear down our watcher, then run the normal entry flow.
+              try {
+                ch.unsubscribe();
+              } catch {
+                /* ignore */
+              }
+              requestsChannelRef.current = null;
+              setWaiting(null);
+              try {
+                await enterRoomAfterMembership(roomIdArg, 'guest');
+              } catch (e: any) {
+                setError(e?.message ?? 'Failed to enter the room');
+                setStatus('error');
+              }
+            } else if (r.status === 'rejected') {
+              setWaiting((w) =>
+                w && w.requestId === requestId
+                  ? { ...w, status: 'rejected' }
+                  : w
+              );
+              setError('The host rejected your request to join.');
+            }
+          }
+        )
+        .subscribe();
+      requestsChannelRef.current = ch;
+      // Suppress lint for unused token — we keep it around in WaitingState
+      // so the UI can show a "re-request" button later if we want.
+      void token;
+    },
+    [enterRoomAfterMembership]
+  );
+
   const joinRoom = useCallback(
     async (targetRoomId: string, inviteToken?: string) => {
       const id = targetRoomId.trim();
       if (!id) return;
-
       if (!user) {
         setError('You must be signed in to join a room.');
         setStatus('error');
@@ -349,96 +855,223 @@ export function useWebRTC(): UseWebRTCResult {
       setRoomId(id);
       roomIdRef.current = id;
       setChat([]);
+      setPresenceRows([]);
+      setPendingRequests([]);
+      setWaiting(null);
+      setWaitingRoomEnabledState(false);
+      peersRef.current.clear();
+      setMicOn(true);
+      setCamOn(true);
+      setHandRaised(false);
 
-      // Pick the mode up front. The lobby decides "host" when the
-      // user clicks Create Room, and "guest" when they click Join
-      // Room (with a token). We default to host so a Join without a
-      // token still works for the open-room case during local dev.
       const mode: 'host' | 'guest' = inviteToken ? 'guest' : 'host';
 
       try {
-        // 0. Membership. The two RPCs are the only paths the server
-        //    allows to write to `room_members`. The guest path
-        //    requires a valid unused unexpired invite token.
-        await joinRoomRpc(id, mode, inviteToken);
-       setRole(mode);
+        const requestId = await joinRoomRpc(id, mode, inviteToken);
 
-        // 1. Media first.
-        const stream = await startLocalMedia();
-        // 2. Peer connection.
-        createPeer(stream);
-        // 3. Realtime signaling channel.
-        const ch = roomChannel(id);
-        attachSignaling(ch);
-        channelRef.current = ch;
-
-        await new Promise<void>((resolve, reject) => {
-          ch.subscribe(async (status) => {
-            if (status === 'SUBSCRIBED') {
-  await ch.track({ id: selfId, joinedAt: Date.now() });
-  setStatus('in-call');
-  resolve();
-} else if (
-              status === 'CHANNEL_ERROR' ||
-              status === 'TIMED_OUT' ||
-              status === 'CLOSED'
-            ) {
-              reject(new Error(`Channel status: ${status}`));
-            }
+        // Guest + waiting-room-enabled => pause here.
+        if (requestId) {
+          setWaiting({
+            requestId,
+            roomId: id,
+            inviteToken: inviteToken ?? '',
+            status: 'pending',
+            startedAt: Date.now(),
           });
-        });
+          setStatus('joining'); // remain in "joining" while we wait
+          watchOwnRequest(requestId, id, inviteToken ?? '');
+          return;
+        }
 
-        // 4. Chat history + live subscription. We do this AFTER the
-        //    signaling channel is up so the order of "Connected" UI
-        //    updates feels natural.
-        await loadHistory(id);
-        attachChatSubscription(id);
+        await enterRoomAfterMembership(id, mode);
       } catch (e: any) {
         setError(e?.message ?? 'Failed to join room');
         setStatus('error');
       }
     },
-    [attachSignaling, attachChatSubscription, createPeer, loadHistory, startLocalMedia, user, selfId]
+    [enterRoomAfterMembership, user, watchOwnRequest]
   );
 
+  // Guest abandons the waiting room.
+  const cancelWaiting = useCallback(() => {
+    try {
+      requestsChannelRef.current?.unsubscribe();
+    } catch {
+      /* ignore */
+    }
+    requestsChannelRef.current = null;
+    setWaiting(null);
+    setStatus('idle');
+    setError(null);
+    setRoomId(null);
+    roomIdRef.current = null;
+  }, []);
+
+  // Host actions on a single request.
+  const approveRequest = useCallback(async (requestId: string) => {
+    const { error: err } = await supabase.rpc('approve_join', {
+      p_request_id: requestId,
+    });
+    if (err) {
+      setError(`Approve failed: ${err.message}`);
+      return;
+    }
+    // Optimistic: the postgres_changes UPDATE will also drop it, but doing
+    // it here removes the latency between click and the row disappearing.
+    setPendingRequests((prev) => prev.filter((r) => r.id !== requestId));
+  }, []);
+
+  const rejectRequest = useCallback(async (requestId: string) => {
+    const { error: err } = await supabase.rpc('reject_join', {
+      p_request_id: requestId,
+    });
+    if (err) {
+      setError(`Reject failed: ${err.message}`);
+      return;
+    }
+    setPendingRequests((prev) => prev.filter((r) => r.id !== requestId));
+  }, []);
+
+  // Host toggle: flip waiting room on/off for the current room.
+  const setWaitingRoomEnabled = useCallback(
+    async (enabled: boolean) => {
+      const id = roomIdRef.current;
+      if (!id) return;
+      // Optimistic flip so the checkbox feels instant.
+      setWaitingRoomEnabledState(enabled);
+      const { error: err } = await supabase.rpc('set_waiting_room_enabled', {
+        p_room_id: id,
+        p_enabled: enabled,
+      });
+      if (err) {
+        setError(`Could not change waiting room: ${err.message}`);
+        // Roll back the optimistic state.
+        setWaitingRoomEnabledState(!enabled);
+      }
+    },
+    []
+  );
+
+  // Stop a recording in progress. Declared early so hangUp / stopRecording
+  // can both call it. Idempotent — safe to call when no recording active.
+  const stopRecordingInternal = useCallback(() => {
+    const rec = recorderRef.current;
+    if (rec && rec.state !== 'inactive') {
+      try {
+        rec.stop();
+      } catch {
+        /* ignore — onstop handler does the rest */
+      }
+    } else {
+      // No recorder active but timer may still be running on edge cases.
+      if (recordingTimerRef.current !== null) {
+        window.clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+      setIsRecording(false);
+      setElapsedSec(0);
+    }
+  }, []);
+
   const hangUp = useCallback(() => {
+    stopRecordingInternal();
+
+    // Analytics: host-only. Snapshot what we observed during the call
+    // and ship it in one RPC. Fire-and-forget — if it fails we don't
+    // want to block teardown. We capture refs into locals first because
+    // the resets below will clear them.
+    const startedAt = callStartedAtRef.current;
+    const room = roomIdRef.current;
+    if (role === 'host' && startedAt && room) {
+      const endedAt = Date.now();
+      // Stamp leftAt for anyone still in the room (incl. ourselves) so
+      // the recorded session has bounded participant windows.
+      for (const a of analyticsPeersRef.current.values()) {
+        if (a.leftAt === null) a.leftAt = endedAt;
+      }
+      const participantsPayload = Array.from(
+        analyticsPeersRef.current.entries()
+      ).map(([userId, a]) => ({
+        user_id: userId,
+        display_name: a.name,
+        joined_at: new Date(a.joinedAt).toISOString(),
+        left_at: a.leftAt ? new Date(a.leftAt).toISOString() : null,
+      }));
+      // The await is intentionally not awaited — we don't gate hangUp on
+      // the network call. The .catch swallows errors silently because
+      // we've already torn down `setError`'s consumer.
+      void supabase
+        .rpc('record_call_session', {
+          p_room_id: room,
+          p_started_at: new Date(startedAt).toISOString(),
+          p_ended_at: new Date(endedAt).toISOString(),
+          p_peak_participants: Math.max(1, peakParticipantsRef.current),
+          p_message_count: messageCountRef.current,
+          p_participants: participantsPayload,
+        })
+        .then(({ error: err }) => {
+          if (err) console.warn('record_call_session failed', err.message);
+        });
+    }
+
+    // Reset analytics refs for the next call.
+    callStartedAtRef.current = null;
+    peakParticipantsRef.current = 0;
+    messageCountRef.current = 0;
+    analyticsPeersRef.current.clear();
+
+    try {
+      requestsChannelRef.current?.unsubscribe();
+    } catch {
+      /* ignore */
+    }
+    requestsChannelRef.current = null;
+
     channelRef.current?.unsubscribe();
     channelRef.current = null;
-
-    // Tear down the messages subscription too. We find it by name
-    // pattern; removeChannel also accepts the channel object directly.
     supabase.removeAllChannels();
 
-    const pc = pcRef.current;
-    if (pc) {
-      pc.getSenders().forEach((s) => s.track?.stop());
-      pc.close();
+    for (const peerId of Array.from(peersRef.current.keys())) {
+      const entry = peersRef.current.get(peerId);
+      if (entry) {
+        try {
+          entry.pc.close();
+        } catch {
+          /* already closed */
+        }
+        entry.remoteStream.getTracks().forEach((t) => {
+          entry.remoteStream.removeTrack(t);
+        });
+      }
+      peersRef.current.delete(peerId);
     }
-    pcRef.current = null;
-    videoSenderRef.current = null;
-    remoteStreamRef.current?.getTracks().forEach((t) => t.stop());
-    remoteStreamRef.current = null;
+    setPresenceRows([]);
+    setPendingRequests([]);
+    setWaiting(null);
+    setWaitingRoomEnabledState(false);
+    bumpPeerTick();
 
-    // If a screen share is still active, kill its tracks too — the
-    // sender loop above only stops what's currently attached to the
-    // peer connection, which is the screen track; but a defensive
-    // pass over screenStreamRef catches the (multi-track) display
-    // stream including any system-audio track we never wired up.
     screenStreamRef.current?.getTracks().forEach((t) => t.stop());
     screenStreamRef.current = null;
     cameraVideoTrackRef.current = null;
     setScreenOn(false);
 
-    localStream?.getTracks().forEach((t) => t.stop());
+    // Tear down the blur pipeline (frees GPU memory + stops the rAF loop).
+    blur.stop();
+
+    localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    localStreamRef.current = null;
     setLocalStream(null);
-    setRemote({ hasRemote: false, remoteStream: null });
+
     setStatus('idle');
     setError(null);
     setRoomId(null);
     setRole(null);
     roomIdRef.current = null;
     setChat([]);
-  }, [localStream]);
+    setReactions([]);
+    setHandRaised(false);
+  }, [bumpPeerTick, role, stopRecordingInternal]);
 
   useEffect(() => {
     return () => {
@@ -449,53 +1082,79 @@ export function useWebRTC(): UseWebRTCResult {
   }, []);
 
   // --- Controls + chat send -------------------------------------------------
-
   const toggleMic = useCallback(() => {
-    const stream = localStream;
+    const stream = localStreamRef.current;
     if (!stream) return;
     const next = !micOn;
     stream.getAudioTracks().forEach((t) => (t.enabled = next));
     setMicOn(next);
-  }, [localStream, micOn]);
+  }, [micOn]);
 
   const toggleCam = useCallback(() => {
-    const stream = localStream;
+    const stream = localStreamRef.current;
     if (!stream) return;
     const next = !camOn;
     stream.getVideoTracks().forEach((t) => (t.enabled = next));
     setCamOn(next);
-  }, [localStream, camOn]);
+  }, [camOn]);
+
+  const toggleHand = useCallback(() => {
+    setHandRaised((h) => !h);
+  }, []);
+
+  const lowerAllHands = useCallback(() => {
+    const ch = channelRef.current;
+    if (!ch || role !== 'host') {
+      setError('Only the host can lower all hands.');
+      return;
+    }
+    ch.send({
+      type: 'broadcast',
+      event: 'lower-hands',
+      payload: { from: selfId },
+    });
+    // Also drop our own immediately (the broadcast doesn't echo to self).
+    setHandRaised(false);
+  }, [role, selfId]);
+
+  const sendReaction = useCallback(
+    (emoji: ReactionEmoji) => {
+      const ch = channelRef.current;
+      if (!ch) return;
+      const at = Date.now();
+      // Local echo so we see our own reaction even though self-broadcast
+      // is disabled (see lib/supabase.ts: broadcast.self = false).
+      const local: Reaction = { id: uuid(), from: selfId, emoji, at };
+      setReactions((prev) => [...prev, local]);
+      window.setTimeout(() => {
+        setReactions((prev) => prev.filter((x) => x.id !== local.id));
+      }, REACTION_TTL_MS);
+
+      ch.send({
+        type: 'broadcast',
+        event: 'reaction',
+        payload: { from: selfId, emoji, at },
+      });
+    },
+    [selfId]
+  );
 
   // --- Screen sharing -------------------------------------------------------
-  //
-  // We swap the *video sender's* track between the camera track and a
-  // display-capture track via RTCRtpSender.replaceTrack(). Because the
-  // transceiver (and therefore the m-line in the SDP) is unchanged, no
-  // renegotiation is required and the remote browser starts rendering
-  // the new frames as soon as they arrive.
-  //
-  // Audio is intentionally NOT swapped — the mic stays live during a
-  // share. If the user opts to share system/tab audio in the picker we
-  // ignore that audio track (replacing the mic track would be a more
-  // intrusive change and is out of scope here).
-
   const stopScreenShare = useCallback(async () => {
-    const sender = videoSenderRef.current;
     const cameraTrack = cameraVideoTrackRef.current;
     const screenStream = screenStreamRef.current;
 
-    if (sender && cameraTrack) {
-      // Restore the camera on the wire. replaceTrack() returns a Promise
-      // but the API is fire-and-forget safe — we await for correctness.
-      try {
-        await sender.replaceTrack(cameraTrack);
-      } catch (e: any) {
-        setError(`Could not restore camera: ${e?.message ?? e}`);
+    if (cameraTrack) {
+      for (const entry of peersRef.current.values()) {
+        if (!entry.videoSender) continue;
+        try {
+          await entry.videoSender.replaceTrack(cameraTrack);
+        } catch (e: any) {
+          setError(`Could not restore camera: ${e?.message ?? e}`);
+        }
       }
     }
 
-    // Tear down the display-capture stream's tracks so the browser's
-    // "Sharing your screen" indicator goes away.
     screenStream?.getTracks().forEach((t) => t.stop());
 
     screenStreamRef.current = null;
@@ -504,22 +1163,18 @@ export function useWebRTC(): UseWebRTCResult {
   }, []);
 
   const startScreenShare = useCallback(async () => {
-    const sender = videoSenderRef.current;
-    if (!sender || !localStream) {
+    const media = localStreamRef.current;
+    if (!media) {
       setError('Not ready to share screen yet.');
       return;
     }
     let display: MediaStream;
     try {
-      // `audio: true` is a hint — the browser shows an opt-in checkbox
-      // and may ignore it entirely. We accept whatever the user picks.
       display = await navigator.mediaDevices.getDisplayMedia({
         video: true,
         audio: true,
       });
     } catch (e: any) {
-      // The user dismissing the picker also lands here as a NotAllowedError.
-      // We only surface a real error if something other than dismissal happened.
       if (e?.name !== 'NotAllowedError') {
         setError(`Could not start screen share: ${e?.message ?? e}`);
       }
@@ -533,69 +1188,300 @@ export function useWebRTC(): UseWebRTCResult {
       return;
     }
 
-    // Remember the camera track so we can restore it on stop.
+    const firstPeer = peersRef.current.values().next().value as
+      | PeerEntry
+      | undefined;
     const currentCamTrack =
-      sender.track ?? localStream.getVideoTracks()[0] ?? null;
+      firstPeer?.videoSender?.track ?? media.getVideoTracks()[0] ?? null;
     cameraVideoTrackRef.current = currentCamTrack;
     screenStreamRef.current = display;
 
-    // Hot-swap on the existing sender. No renegotiation; the remote
-    // ontrack handler does NOT fire again — same MediaStreamTrack from
-    // their POV, just new frames.
-    try {
-      await sender.replaceTrack(screenTrack);
-    } catch (e: any) {
-      setError(`Could not start screen share: ${e?.message ?? e}`);
-      display.getTracks().forEach((t) => t.stop());
-      screenStreamRef.current = null;
-      cameraVideoTrackRef.current = null;
-      return;
+    for (const entry of peersRef.current.values()) {
+      if (!entry.videoSender) continue;
+      try {
+        await entry.videoSender.replaceTrack(screenTrack);
+      } catch (e: any) {
+        setError(`Could not start screen share for a peer: ${e?.message ?? e}`);
+      }
     }
 
-    // When the user clicks the browser-native "Stop sharing" pill,
-    // the track fires `ended` — flip our state back so the UI matches.
     screenTrack.onended = () => {
       void stopScreenShare();
     };
 
     setScreenOn(true);
-  }, [localStream, stopScreenShare]);
+  }, [stopScreenShare]);
 
   const toggleScreenShare = useCallback(async () => {
-    if (screenOn) {
-      await stopScreenShare();
-    } else {
-      await startScreenShare();
-    }
+    if (screenOn) await stopScreenShare();
+    else await startScreenShare();
   }, [screenOn, startScreenShare, stopScreenShare]);
+
+  // --- Background blur ------------------------------------------------------
+  //
+  // The blur hook reads the local camera stream and returns a *new*
+  // MediaStream whose video track is the segmented/blurred output. We
+  // swap that track onto every peer's video sender via replaceTrack(),
+  // same hot-swap pattern as screen share — no SDP renegotiation.
+  //
+  // Mutually exclusive with screen share: if the user toggles blur while
+  // sharing, we silently no-op (the screen is what peers want to see).
+
+  const blur = useBackgroundBlur({ source: localStream });
+
+  const stopBlur = useCallback(async () => {
+    // Restore the camera track on every peer first, THEN tear down the
+    // blur pipeline. Doing it in this order means peers never briefly see
+    // a frozen frame between the swap-back and the canvas stopping.
+    const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+    if (cameraTrack) {
+      for (const entry of peersRef.current.values()) {
+        if (!entry.videoSender) continue;
+        try {
+          await entry.videoSender.replaceTrack(cameraTrack);
+        } catch (e: any) {
+          setError(`Could not restore camera: ${e?.message ?? e}`);
+        }
+      }
+    }
+    blur.stop();
+  }, [blur]);
+
+  const startBlur = useCallback(async () => {
+    if (screenOn) {
+      // Don't interfere with an active share. The user can re-toggle
+      // blur after stopping the share.
+      return;
+    }
+    if (!localStreamRef.current) {
+      setError('Camera is not ready yet.');
+      return;
+    }
+    await blur.start();
+    const blurred = blur.blurredStream;
+    // start() resolves before the first frame is composited, so the
+    // captured stream may not yet have tracks. Wait one rAF tick.
+    const blurredTrack = await waitForFirstVideoTrack(blurred);
+    if (!blurredTrack) {
+      setError('Background blur failed to produce a video track.');
+      return;
+    }
+    for (const entry of peersRef.current.values()) {
+      if (!entry.videoSender) continue;
+      try {
+        await entry.videoSender.replaceTrack(blurredTrack);
+      } catch (e: any) {
+        setError(`Could not enable blur for a peer: ${e?.message ?? e}`);
+      }
+    }
+  }, [blur, screenOn]);
+
+  const toggleBlur = useCallback(async () => {
+    if (blur.enabled) await stopBlur();
+    else await startBlur();
+  }, [blur.enabled, startBlur, stopBlur]);
+
+  // When peers join *after* blur is already on, their fresh PC was set
+  // up with the raw camera track in createPeerFor. Swap them now too.
+  useEffect(() => {
+    if (!blur.enabled || !blur.blurredStream) return;
+    const track = blur.blurredStream.getVideoTracks()[0];
+    if (!track) return;
+    for (const entry of peersRef.current.values()) {
+      // Only swap senders that aren't already using a non-camera track
+      // (so we don't clobber screen-share — which can't happen given
+      // the mutex above, but defense-in-depth).
+      if (entry.videoSender && entry.videoSender.track !== track) {
+        entry.videoSender.replaceTrack(track).catch(() => {});
+      }
+    }
+  }, [blur.enabled, blur.blurredStream, peerTick]);
+
+  // --- Recording ------------------------------------------------------------
+  //
+  // We build ONE recording MediaStream:
+  //   - Video: whatever the local video sender is currently sending. We
+  //     read it from the first peer's videoSender if present, else fall
+  //     back to the local camera track. This means screen share is
+  //     captured automatically (it's the same track we already swapped).
+  //     If no peers yet, we use the local camera track directly.
+  //   - Audio: every audio track in the room — our mic plus every remote
+  //     audio track — summed via Web Audio's MediaStreamDestination.
+  //
+  // MediaRecorder asks the browser to encode this composite into WebM.
+  // On stop, we glue the chunks into a Blob and trigger a download.
+
+  const buildRecordingStream = useCallback((): MediaStream | null => {
+    const localMedia = localStreamRef.current;
+    if (!localMedia) return null;
+
+    // Video: prefer whatever is currently on the wire (could be screen
+    // share). Fall back to the local camera track.
+    const firstPeer = peersRef.current.values().next().value as
+      | PeerEntry
+      | undefined;
+    const videoTrack =
+      firstPeer?.videoSender?.track ??
+      localMedia.getVideoTracks()[0] ??
+      null;
+    if (!videoTrack) return null;
+
+    // Audio: mix mic + every remote. AudioContext is required because
+    // a MediaStream can hold many audio tracks but most encoders only
+    // mux the first one. We create source nodes per track and sum into
+    // a single destination node.
+    const ctx = new (window.AudioContext ||
+      (window as any).webkitAudioContext)();
+    recordingMixCtxRef.current = ctx;
+    const dest = ctx.createMediaStreamDestination();
+
+    const addAudio = (stream: MediaStream) => {
+      if (stream.getAudioTracks().length === 0) return;
+      // AudioContext can connect a stream node even when individual tracks
+      // are muted; we don't try to dedupe per track because the browser
+      // already coalesces silent ones.
+      const src = ctx.createMediaStreamSource(stream);
+      src.connect(dest);
+    };
+
+    addAudio(localMedia);
+    for (const entry of peersRef.current.values()) {
+      addAudio(entry.remoteStream);
+    }
+
+    const mixed = new MediaStream();
+    mixed.addTrack(videoTrack);
+    dest.stream.getAudioTracks().forEach((t) => mixed.addTrack(t));
+    return mixed;
+  }, []);
+
+  // Pick the best supported WebM codec the browser advertises.
+  const pickMimeType = (): string => {
+    const candidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ];
+    for (const m of candidates) {
+      if (
+        typeof MediaRecorder !== 'undefined' &&
+        MediaRecorder.isTypeSupported(m)
+      ) {
+        return m;
+      }
+    }
+    return 'video/webm';
+  };
+
+  const startRecording = useCallback(async () => {
+    if (recorderRef.current && recorderRef.current.state !== 'inactive') return;
+    if (typeof MediaRecorder === 'undefined') {
+      setError('Recording is not supported in this browser.');
+      return;
+    }
+    const stream = buildRecordingStream();
+    if (!stream) {
+      setError('Could not start recording: no local media yet.');
+      return;
+    }
+
+    const mimeType = pickMimeType();
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(stream, { mimeType });
+    } catch (e: any) {
+      setError(`MediaRecorder failed to initialize: ${e?.message ?? e}`);
+      recordingMixCtxRef.current?.close().catch(() => {});
+      recordingMixCtxRef.current = null;
+      return;
+    }
+
+    recordedChunksRef.current = [];
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) {
+        recordedChunksRef.current.push(ev.data);
+      }
+    };
+    recorder.onstop = () => {
+      const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+      recordedChunksRef.current = [];
+
+      // Anchor-click download. URL.createObjectURL is cheap to allocate
+      // and we revoke immediately after the click is dispatched.
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[:.]/g, '-')
+        .slice(0, 19);
+      a.download = `meeting-${roomIdRef.current ?? 'recording'}-${stamp}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Slight delay so Safari has finished reading the blob.
+      window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+      // Tear down the audio mix.
+      recordingMixCtxRef.current?.close().catch(() => {});
+      recordingMixCtxRef.current = null;
+      recorderRef.current = null;
+
+      if (recordingTimerRef.current !== null) {
+        window.clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+      setIsRecording(false);
+      setElapsedSec(0);
+    };
+
+    recorderRef.current = recorder;
+    recordingStartedAtRef.current = Date.now();
+    // 1s timeslice → ondataavailable fires once per second, keeping
+    // chunk count bounded and giving us early data if the tab crashes.
+    recorder.start(1000);
+    setIsRecording(true);
+    setElapsedSec(0);
+
+    recordingTimerRef.current = window.setInterval(() => {
+      setElapsedSec(
+        Math.floor((Date.now() - recordingStartedAtRef.current) / 1000)
+      );
+    }, 250);
+  }, [buildRecordingStream]);
+
+  const stopRecording = useCallback(() => {
+    stopRecordingInternal();
+  }, [stopRecordingInternal]);
+
+  const recording: RecordingControls = useMemo(
+    () => ({
+      isRecording,
+      elapsedSec,
+      startRecording,
+      stopRecording,
+    }),
+    [isRecording, elapsedSec, startRecording, stopRecording]
+  );
 
   const sendChat = useCallback(
     async (text: string) => {
       const clean = text.trim();
       if (!clean || !roomIdRef.current || !user) return;
-      // RLS will reject this insert if `user_id` doesn't match auth.uid(),
-      // so we set it from the session, never from the form.
       const { error: err } = await supabase.from('messages').insert({
         room_id: roomIdRef.current,
         user_id: user.id,
         text: clean,
       });
-      if (err) {
-        setError(`Could not send message: ${err.message}`);
-      }
-      // On success the postgres_changes subscription will append the
-      // message to the panel — we don't optimistically add it.
+      if (err) setError(`Could not send message: ${err.message}`);
     },
     [user]
   );
 
-  // Host-only: mint a fresh invite token for the current room.
-  // `expiresInSeconds` defaults to 24 hours; the server clamps the
-  // window to a sensible range (1 minute .. 7 days).
-  // Returns the token string on success, or null on failure (with
-  // `error` set).
   const createInvite = useCallback(
-    async (expiresInSeconds: number = 24 * 60 * 60): Promise<string | null> => {
+    async (
+      expiresInSeconds: number = 24 * 60 * 60
+    ): Promise<string | null> => {
       if (!roomIdRef.current || !user) {
         setError('You must be in a room to create an invite.');
         return null;
@@ -608,7 +1494,6 @@ export function useWebRTC(): UseWebRTCResult {
         p_room_id: roomIdRef.current,
         p_expires_in_seconds: expiresInSeconds,
       });
-      console.log('invite rpc result', { data, err });
       if (err || !data) {
         setError(`Could not create invite: ${err?.message ?? 'unknown error'}`);
         return null;
@@ -618,19 +1503,99 @@ export function useWebRTC(): UseWebRTCResult {
     [role, user]
   );
 
+  // --- Derive public participants array ------------------------------------
+  //
+  // Self is always first; remote peers follow in their presence joinedAt
+  // order. peerTick is read so React recomputes on track/state changes.
+  const participants: Participant[] = useMemo(() => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const _ = peerTick;
+    const selfRow = presenceRows.find((r) => r.id === selfId);
+    const others = presenceRows
+      .filter((r) => r.id !== selfId)
+      .sort((a, b) => (a.joinedAt ?? 0) - (b.joinedAt ?? 0));
+
+    const list: Participant[] = [];
+    if (status === 'in-call' && localStream) {
+      list.push({
+        id: selfId,
+        name: selfRow?.name ?? selfName,
+        isHost: selfRow?.isHost ?? role === 'host',
+        isSelf: true,
+        // Fall back to local state if the presence echo hasn't landed yet.
+        micOn: selfRow?.micOn ?? micOn,
+        camOn: selfRow?.camOn ?? camOn,
+        handRaised: selfRow?.handRaised ?? handRaised,
+        stream: localStream,
+        hasMedia: true,
+        connectionState: 'connected',
+      });
+    }
+    for (const r of others) {
+      const peer = peersRef.current.get(r.id);
+      list.push({
+        id: r.id,
+        name: r.name ?? r.id.slice(0, 6),
+        isHost: !!r.isHost,
+        isSelf: false,
+        micOn: !!r.micOn,
+        camOn: !!r.camOn,
+        handRaised: !!r.handRaised,
+        stream: peer?.remoteStream ?? null,
+        hasMedia: !!peer?.hasMedia,
+        connectionState: peer?.connectionState ?? 'new',
+      });
+    }
+    return list;
+  }, [
+    peerTick,
+    presenceRows,
+    selfId,
+    selfName,
+    role,
+    status,
+    localStream,
+    micOn,
+    camOn,
+    handRaised,
+  ]);
+
   return {
     status,
     error,
     roomId,
     role,
     localStream,
-    remote,
-    controls: { micOn, camOn, screenOn, toggleMic, toggleCam, toggleScreenShare },
+    participants,
+    participantCount: participants.length,
+    controls: {
+      micOn,
+      camOn,
+      screenOn,
+      blurOn: blur.enabled,
+      blurLoading: blur.loading,
+      toggleMic,
+      toggleCam,
+      toggleScreenShare,
+      toggleBlur,
+    },
+    reactions,
+    sendReaction,
+    toggleHand,
+    lowerAllHands,
+    recording,
     chat,
     chatLoading,
     sendChat,
     joinRoom,
     createInvite,
+    waiting,
+    cancelWaiting,
+    pendingRequests,
+    approveRequest,
+    rejectRequest,
+    waitingRoomEnabled,
+    setWaitingRoomEnabled,
     hangUp,
   };
 }

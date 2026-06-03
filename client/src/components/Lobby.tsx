@@ -11,6 +11,8 @@
 
 import { useState } from 'react';
 import { useAuth } from '../lib/auth';
+import { MeetingsDashboard } from './MeetingsDashboard';
+import { AnalyticsDashboard } from './AnalyticsDashboard';
 
 interface Props {
   onJoin: (roomId: string, inviteToken?: string) => void;
@@ -68,7 +70,7 @@ export function Lobby({ onJoin, busy, error }: Props) {
   const envMissing = !url || !key || url.includes('YOUR_PROJECT_REF');
 
   return (
-    <div className="mx-auto flex w-full max-w-md flex-col gap-4">
+    <div className="mx-auto flex w-full max-w-lg flex-col gap-4">
       <header className="flex items-center justify-between text-xs text-slate-400">
         <span>
           Signed in as{' '}
@@ -155,6 +157,16 @@ export function Lobby({ onJoin, busy, error }: Props) {
         <em> I have an invite code</em>, paste it, and click{' '}
         <strong>Join Room</strong>.
       </div>
+
+      {/* Scheduled-meetings dashboard. Lives in the lobby so the user
+          can plan / kick off meetings without entering a call first.
+          Joining from here goes through the same onJoin pipeline as the
+          buttons above, so all the auth / waiting-room logic applies. */}
+      <MeetingsDashboard onJoin={onJoin} />
+
+      {/* Meeting analytics — host-only data, but the panel renders an
+          empty-state for guests too. RLS hides other hosts' rows. */}
+      <AnalyticsDashboard />
     </div>
   );
 }

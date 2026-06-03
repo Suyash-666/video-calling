@@ -4,9 +4,10 @@
 //   - lobby:       signed in, not in a call -> <Lobby />
 //   - in-call:     signed in, joined a room -> video tiles + controls
 //
-// The chat tab + slide-in <ChatPanel /> are only available in-call.
+// The chat tab + slide-in <ChatPanel /> are only available in-call, and
+// a participant sidebar slides in from the right when toggled.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useWebRTC } from './hooks/useWebRTC';
 import { useAuth } from './lib/auth';
 import { AuthScreen } from './components/AuthScreen';
@@ -14,6 +15,9 @@ import { Lobby } from './components/Lobby';
 import { VideoTile } from './components/VideoTile';
 import { ControlBar } from './components/ControlBar';
 import { ChatPanel } from './components/ChatPanel';
+import { ParticipantSidebar } from './components/ParticipantSidebar';
+import { WaitingScreen, WaitingRoomPanel } from './components/WaitingRoom';
+import { MAX_PARTICIPANTS } from './types';
 
 export default function App() {
   const { user, loading } = useAuth();
@@ -22,18 +26,31 @@ export default function App() {
     error,
     roomId,
     role,
-    localStream,
-    remote,
+    participants,
+    participantCount,
     controls,
+    reactions,
+    sendReaction,
+    toggleHand,
+    lowerAllHands,
+    recording,
     chat,
     chatLoading,
     sendChat,
     joinRoom,
     createInvite,
+    waiting,
+    cancelWaiting,
+    pendingRequests,
+    approveRequest,
+    rejectRequest,
+    waitingRoomEnabled,
+    setWaitingRoomEnabled,
     hangUp,
   } = useWebRTC();
 
   const [chatOpen, setChatOpen] = useState(false);
+  const [participantsOpen, setParticipantsOpen] = useState(false);
   const [inviteFeedback, setInviteFeedback] = useState<string | null>(null);
   const [invitePanelOpen, setInvitePanelOpen] = useState(false);
   // Custom-minutes input, in minutes. Empty string means "use a preset".
@@ -86,6 +103,32 @@ export default function App() {
 
   const inCall = status === 'joining' || status === 'in-call';
 
+  // Bucket the live reactions by participant id so each tile only re-renders
+  // when its own reactions change. Computed once per `reactions` update.
+  const reactionsByPeer = useMemo(() => {
+    const m = new Map<string, typeof reactions>();
+    for (const r of reactions) {
+      const arr = m.get(r.from) ?? [];
+      arr.push(r);
+      m.set(r.from, arr);
+    }
+    return m;
+  }, [reactions]);
+
+  const selfId = user?.id ?? '';
+  const iAmHost = role === 'host';
+
+  // Grid columns scale with participant count: 1 -> 1 col, 2 -> 2,
+  // 3-4 -> 2 (1 on mobile), 5-6 -> 3 on md+.
+  const gridClass =
+    participantCount <= 1
+      ? 'grid grid-cols-1'
+      : participantCount === 2
+        ? 'grid grid-cols-1 gap-4 sm:grid-cols-2'
+        : participantCount <= 4
+          ? 'grid grid-cols-1 gap-4 sm:grid-cols-2'
+          : 'grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-3';
+
   // While the initial session is being restored, show a tiny placeholder
   // so we don't flash the auth screen for signed-in users.
   if (loading) {
@@ -102,6 +145,11 @@ export default function App() {
         <div className="flex min-h-[80vh] items-center">
           <AuthScreen />
         </div>
+      ) : waiting ? (
+        // Guest is parked in the waiting room. Render the splash; the
+        // hook will flip `waiting` to null once the host approves us, at
+        // which point this branch falls through to the in-call UI.
+        <WaitingScreen waiting={waiting} onCancel={cancelWaiting} />
       ) : !inCall ? (
         <div className="flex min-h-[80vh] items-center">
           <Lobby onJoin={joinRoom} busy={false} error={error} />
@@ -129,19 +177,45 @@ export default function App() {
                   {role}
                 </span>
               )}
+              <span
+                className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300"
+                title={`Up to ${MAX_PARTICIPANTS} participants per room`}
+              >
+                👥 {participantCount} / {MAX_PARTICIPANTS}
+              </span>
+              {recording.isRecording && (
+                <span
+                  className="flex items-center gap-1 rounded-full bg-red-900/40 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-red-300"
+                  title="Recording in progress"
+                >
+                  <span
+                    className="inline-block h-2 w-2 rounded-full bg-red-400"
+                    style={{ animation: 'recPulse 1s ease-in-out infinite' }}
+                  />
+                  REC {fmtMmSs(recording.elapsedSec)}
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-3">
               {role === 'host' && (
                 <div className="relative" ref={inviteWrapperRef}>
                   <button
                     onClick={() => setInvitePanelOpen((o) => !o)}
-                    className="rounded bg-slate-800 px-3 py-1 text-xs font-medium text-slate-200 hover:bg-slate-700"
+                    className="relative rounded bg-slate-800 px-3 py-1 text-xs font-medium text-slate-200 hover:bg-slate-700"
                   >
                     📨 Invite
+                    {pendingRequests.length > 0 && (
+                      <span
+                        className="absolute -right-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-amber-500 px-1 text-[9px] font-bold text-slate-900"
+                        title={`${pendingRequests.length} waiting for approval`}
+                      >
+                        {pendingRequests.length}
+                      </span>
+                    )}
                   </button>
                   {invitePanelOpen && (
                     <div
-                      className="absolute right-0 z-30 mt-2 w-64 rounded-lg border border-slate-700 bg-slate-900 p-3 shadow-xl"
+                      className="absolute right-0 z-30 mt-2 w-80 rounded-lg border border-slate-700 bg-slate-900 p-3 shadow-xl"
                       onClick={(e) => e.stopPropagation()}
                     >
                       <p className="mb-2 text-[10px] uppercase tracking-wider text-slate-500">
@@ -184,6 +258,18 @@ export default function App() {
                       <p className="mt-2 text-[10px] text-slate-500">
                         Server clamps to 1 min .. 7 days.
                       </p>
+                      <div className="mt-3 border-t border-slate-700 pt-3">
+                        {/* Waiting-room toggle + inbox lives here so the
+                            host's "manage who comes in" tools are one
+                            click away, beside invite minting. */}
+                        <WaitingRoomPanel
+                          enabled={waitingRoomEnabled}
+                          onToggleEnabled={setWaitingRoomEnabled}
+                          requests={pendingRequests}
+                          onApprove={approveRequest}
+                          onReject={rejectRequest}
+                        />
+                      </div>
                     </div>
                   )}
                 </div>
@@ -202,26 +288,56 @@ export default function App() {
             </p>
           )}
 
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <VideoTile
-              stream={localStream}
-              muted
-              // Mirror the camera preview (feels natural), but NOT when
-              // we're broadcasting the screen — flipped text would be
-              // confusing if we ever show the screen track here.
-              mirrored={!controls.screenOn}
-              label={controls.screenOn ? 'You (sharing screen)' : 'You'}
-              placeholder="Starting camera…"
-            />
-            <VideoTile
-              stream={remote.remoteStream}
-              muted={false}
-              label="Remote"
-              placeholder={remote.hasRemote ? '' : 'Waiting for the other person…'}
-            />
+          {/*
+            Responsive video grid. `participants` includes the local user as
+            the first entry now, so we just map over it directly — no need
+            to render localStream separately. Each tile gets its own
+            reactions slice and the participant's raise-hand state.
+          */}
+          <div className={gridClass}>
+            {participants.map((p) => (
+              <VideoTile
+                key={p.id}
+                stream={p.stream}
+                muted={p.isSelf}
+                // Mirror the local camera preview (feels natural), but not
+                // when we're broadcasting the screen — flipped text would
+                // be confusing.
+                mirrored={p.isSelf && !controls.screenOn}
+                label={
+                  p.isSelf
+                    ? controls.screenOn
+                      ? 'You (sharing screen)'
+                      : 'You'
+                    : p.name
+                }
+                placeholder={
+                  p.isSelf
+                    ? 'Starting camera…'
+                    : p.connectionState === 'failed'
+                      ? 'Connection failed'
+                      : !p.hasMedia
+                        ? 'Connecting…'
+                        : ''
+                }
+                handRaised={p.handRaised}
+                reactions={reactionsByPeer.get(p.id)}
+              />
+            ))}
           </div>
 
-          <ControlBar controls={controls} onHangUp={hangUp} />
+          <ControlBar
+            controls={controls}
+            recording={recording}
+            handRaised={
+              participants.find((p) => p.isSelf)?.handRaised ?? false
+            }
+            onToggleHand={toggleHand}
+            onSendReaction={sendReaction}
+            onToggleParticipants={() => setParticipantsOpen((o) => !o)}
+            participantCount={participantCount}
+            onHangUp={hangUp}
+          />
 
           {error && <p className="text-center text-sm text-red-400">{error}</p>}
 
@@ -240,8 +356,32 @@ export default function App() {
             onSend={sendChat}
             onClose={() => setChatOpen(false)}
           />
+
+          <ParticipantSidebar
+            open={participantsOpen}
+            onClose={() => setParticipantsOpen(false)}
+            participants={participants}
+            selfId={selfId}
+            isHost={iAmHost}
+            onLowerAllHands={lowerAllHands}
+          />
+
+          <style>{`
+            @keyframes recPulse {
+              0%, 100% { opacity: 1; }
+              50% { opacity: 0.3; }
+            }
+          `}</style>
         </div>
       )}
     </div>
   );
+}
+
+// MM:SS for the header recording chip. Same logic as ControlBar's helper
+// but the duplication is intentional — keeps each component freestanding.
+function fmtMmSs(sec: number): string {
+  const m = Math.floor(sec / 60).toString().padStart(2, '0');
+  const s = (sec % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
 }
