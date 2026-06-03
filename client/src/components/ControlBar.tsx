@@ -188,17 +188,19 @@ export function ControlBar({
       </PillButton>
 
       {/* Recording. The active state shows a pulsing live dot
-          and a tabular-num MM:SS. Tapping stops. */}
+          and a tabular-num MM:SS. Tapping stops. We don't gate on
+          a separate `loading` flag (RecordingControls doesn't
+          expose one) — `isRecording` is the source of truth, and
+          the async startRecording call won't double-fire because
+          the hook flips isRecording true synchronously on click. */}
       <button
         onClick={() => {
           if (recording.isRecording) recording.stopRecording();
           else void recording.startRecording();
         }}
-        disabled={recording.loading}
         className={`flex h-10 items-center gap-2 rounded-full px-3
                     text-small font-medium outline-none
                     transition-colors duration-180 ease-out
-                    disabled:opacity-30
                     ${
                       recording.isRecording
                         ? 'bg-state-error/15 text-state-error'
