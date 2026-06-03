@@ -100,6 +100,14 @@ export function useWebRTC(): UseWebRTCResult {
   // user opted in) on toggle-off / hang-up.
   const screenStreamRef = useRef<MediaStream | null>(null);
 
+  // A single MediaStream we own that accumulates incoming remote tracks.
+  // `ontrack` fires once per track (audio + video). Using `ev.streams[0]`
+  // can give us a stream whose tracks aren't all attached yet at the
+  // moment we hand it to <video srcObject>, especially on the first fire.
+  // We build our own stream and add tracks as they arrive — the video
+  // element sees the new track and starts rendering it.
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+
   // --- WebRTC plumbing (unchanged) ------------------------------------------
 
   const startLocalMedia = useCallback(async () => {
@@ -128,9 +136,29 @@ export function useWebRTC(): UseWebRTCResult {
     videoSenderRef.current =
       pc.getSenders().find((s) => s.track?.kind === 'video') ?? null;
 
+    // Fresh remote stream for this peer connection. We hold it in a ref
+    // (stable identity) AND mirror it into state so VideoTile re-renders
+    // when the first track arrives. After that, both tracks land on the
+    // SAME MediaStream — the <video> element picks up the second one
+    // automatically without React needing to re-attach srcObject.
+    const remoteStream = new MediaStream();
+    remoteStreamRef.current = remoteStream;
+    setRemote({ hasRemote: false, remoteStream });
+
     pc.ontrack = (ev) => {
-      const incoming = ev.streams[0] ?? new MediaStream([ev.track]);
-      setRemote({ hasRemote: true, remoteStream: incoming });
+      const target = remoteStreamRef.current;
+      if (!target) return;
+      // De-dupe: addTrack on a stream that already has the track is a
+      // silent no-op in spec, but being explicit keeps the intent clear.
+      if (!target.getTracks().some((t) => t.id === ev.track.id)) {
+        target.addTrack(ev.track);
+      }
+      // When the remote ends a track (e.g. they hangup mid-call), drop
+      // it so we don't keep a dead track in the stream.
+      ev.track.onended = () => {
+        target.removeTrack(ev.track);
+      };
+      setRemote({ hasRemote: true, remoteStream: target });
     };
 
     pc.onicecandidate = (ev) => {
@@ -217,6 +245,10 @@ export function useWebRTC(): UseWebRTCResult {
       });
 
       ch.on('presence', { event: 'leave' }, () => {
+        // Drop any tracks the peer was sending and reset to "waiting".
+        remoteStreamRef.current?.getTracks().forEach((t) => {
+          remoteStreamRef.current!.removeTrack(t);
+        });
         setRemote({ hasRemote: false, remoteStream: null });
         setChat((prev) => [
           ...prev,
@@ -384,6 +416,8 @@ export function useWebRTC(): UseWebRTCResult {
     }
     pcRef.current = null;
     videoSenderRef.current = null;
+    remoteStreamRef.current?.getTracks().forEach((t) => t.stop());
+    remoteStreamRef.current = null;
 
     // If a screen share is still active, kill its tracks too — the
     // sender loop above only stops what's currently attached to the
