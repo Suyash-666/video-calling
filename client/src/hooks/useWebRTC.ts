@@ -321,6 +321,32 @@ export function useWebRTC(): UseWebRTCResult {
         if (track.kind === 'video') videoSender = sender;
       });
 
+      // Create a tiny data channel purely as a keepalive. Symmetric
+      // NATs and some corporate firewalls tear down UDP flows that
+      // look idle after ~30s, which is exactly the symptom we were
+      // seeing ('works for a few seconds, then disconnects'). Sending
+      // a no-op on this channel every 5s keeps the NAT mapping warm
+      // and trips the ICE consent freshness check. Negotiation is
+      // unaffected — both sides add a data-channel m-line automatically.
+      const keepaliveCh = pc.createDataChannel('keepalive', {
+        ordered: false,
+        maxRetransmits: 0,
+      });
+      let keepaliveTimer: number | null = null;
+      const startKeepalive = () => {
+        if (keepaliveTimer != null) return;
+        keepaliveTimer = window.setInterval(() => {
+          if (keepaliveCh.readyState === 'open') {
+            try {
+              keepaliveCh.send('ping');
+            } catch {
+              /* ignore */
+            }
+          }
+        }, 5000);
+      };
+      keepaliveCh.onopen = startKeepalive;
+
       const remoteStream = new MediaStream();
 
       const entry: PeerEntry = {
@@ -329,6 +355,13 @@ export function useWebRTC(): UseWebRTCResult {
         remoteStream,
         hasMedia: false,
         connectionState: pc.connectionState,
+      };
+      // Expose the timer to removePeer() so teardown can stop it.
+      // Re-set it once the channel actually opens.
+      (entry as any)._keepaliveTimer = null;
+      keepaliveCh.onopen = () => {
+        startKeepalive();
+        (entry as any)._keepaliveTimer = keepaliveTimer;
       };
       peersRef.current.set(peerId, entry);
 
@@ -351,14 +384,58 @@ export function useWebRTC(): UseWebRTCResult {
           sendSignal('ice-candidate', peerId, {
             candidate: ev.candidate.toJSON(),
           });
+        } else {
+          // Null candidate = end-of-candidates. Useful signal that ICE
+          // gathering is finished; without it we don't know whether the
+          // server-reflexive candidate list was complete.
+          // eslint-disable-next-line no-console
+          console.log('[zoom-mini] ICE gathering complete', peerId.slice(0, 6));
         }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        // eslint-disable-next-line no-console
+        console.log(
+          '[zoom-mini] iceConnectionState',
+          peerId.slice(0, 6),
+          pc.iceConnectionState,
+          'gatheringState:',
+          pc.iceGatheringState
+        );
       };
 
       pc.onconnectionstatechange = () => {
         const e = peersRef.current.get(peerId);
         if (!e) return;
         e.connectionState = pc.connectionState;
+        // eslint-disable-next-line no-console
+        console.log(
+          '[zoom-mini] connectionState',
+          peerId.slice(0, 6),
+          pc.connectionState
+        );
         bumpPeerTick();
+      };
+
+      // The answerer side receives the data channel that the offerer
+      // created. Once it's open, also start pinging so the keepalive
+      // is symmetric on both peers.
+      pc.ondatachannel = (ev) => {
+        const ch = ev.channel;
+        if (ch.label !== 'keepalive') return;
+        ch.onopen = () => {
+          const t = window.setInterval(() => {
+            if (ch.readyState === 'open') {
+              try {
+                ch.send('ping');
+              } catch {
+                /* ignore */
+              }
+            }
+          }, 5000);
+          const e = peersRef.current.get(peerId);
+          if (e) (e as any)._keepaliveTimer = t;
+        };
       };
 
       bumpPeerTick();
@@ -371,6 +448,14 @@ export function useWebRTC(): UseWebRTCResult {
     (peerId: string) => {
       const entry = peersRef.current.get(peerId);
       if (!entry) return;
+      // Stop the keepalive timer before closing the PC. The timer
+      // reference is attached to the entry as a non-enumerable prop
+      // by createPeerFor.
+      const t = (entry as any)._keepaliveTimer as number | null | undefined;
+      if (t != null) {
+        window.clearInterval(t);
+        (entry as any)._keepaliveTimer = null;
+      }
       try {
         // Closing the PC tears down its senders/receivers. Local tracks
         // live on localStream and must not be stopped here — other peers
@@ -379,8 +464,8 @@ export function useWebRTC(): UseWebRTCResult {
       } catch {
         /* already closed */
       }
-      entry.remoteStream.getTracks().forEach((t) => {
-        entry.remoteStream.removeTrack(t);
+      entry.remoteStream.getTracks().forEach((tr) => {
+        entry.remoteStream.removeTrack(tr);
       });
       peersRef.current.delete(peerId);
       bumpPeerTick();
