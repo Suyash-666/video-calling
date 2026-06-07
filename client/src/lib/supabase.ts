@@ -43,6 +43,16 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 // `self: false` on broadcast means we do NOT receive our own messages back,
 // which simplifies the WebRTC hook.
 //
+// `private: true` is critical. Without it, the Supabase Realtime server
+// treats the channel as a public channel and DOES NOT enforce the
+// realtime RLS policies defined in migration 0005 (which gate
+// presence/broadcast on `is_room_member`). With `private: true`, the
+// policies are applied, so only members of the room can see each
+// other on presence. Without it, anyone with the room id could
+// observe the channel — and on a misconfigured project the policies
+// may even silently deny all messages. Marking the channel private
+// is what wires the policies up correctly.
+//
 // Presence key:
 //   We use the caller's user id, NOT a fresh random uuid per channel.
 //   With a random key, a brief network blip that triggers a re-subscribe
@@ -55,8 +65,9 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 export function roomChannel(roomId: string, presenceKey: string): RealtimeChannel {
   return supabase.channel(`room:${roomId}`, {
     config: {
+      private: true,
       broadcast: { ack: false, self: false },
-      presence: { key: presenceKey },
+      presence: { key: presenceKey, enabled: true },
     },
   });
 }

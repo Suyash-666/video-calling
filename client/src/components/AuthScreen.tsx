@@ -24,10 +24,10 @@ import { useState } from 'react';
 import { useAuth } from '../lib/auth';
 import { ArrowRightIcon } from './Icons';
 
-type Mode = 'signin' | 'signup';
+type Mode = 'signin' | 'signup' | 'reset';
 
 export function AuthScreen() {
-  const { signIn, signUp } = useAuth();
+  const { signIn, signUp, resetPassword } = useAuth();
   const [mode, setMode] = useState<Mode>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -41,6 +41,16 @@ export function AuthScreen() {
     setInfo(null);
     setBusy(true);
     try {
+      if (mode === 'reset') {
+        // Reset only needs the email; we deliberately don't pre-check
+        // whether the account exists, so the same success message is
+        // shown either way (avoids account-enumeration leaks).
+        const { error: msg } = await resetPassword(email.trim());
+        if (msg) setError(msg);
+        else
+          setInfo('Check your email for a link to set a new password.');
+        return;
+      }
       const fn = mode === 'signin' ? signIn : signUp;
       const { error: msg } = await fn(email.trim(), password);
       if (msg) setError(msg);
@@ -126,7 +136,9 @@ export function AuthScreen() {
             {/* Mode toggle as a text pair, not a segmented control.
                 The active mode is white with an amber underline;
                 the inactive mode is ink-500. No background, no
-                rounded container. */}
+                rounded container. The 'reset' mode is hidden
+                behind the password field's "Forgot password?"
+                link, so it doesn't appear in this toggle. */}
             <div className="mb-12 flex items-baseline gap-6">
               {(['signin', 'signup'] as const).map((m) => (
                 <button
@@ -174,20 +186,52 @@ export function AuthScreen() {
                 />
               </label>
 
-              <label className="block">
-                <span className="micro-label">PASSWORD</span>
-                <input
-                  type="password"
-                  required
-                  minLength={6}
-                  autoComplete={
-                    mode === 'signin' ? 'current-password' : 'new-password'
-                  }
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="input-bare mt-2"
-                />
-              </label>
+              {/* Password field. Hidden in reset mode — the user
+                  already proved control of the inbox when they
+                  click the link in the recovery email, and asking
+                  for a password here would be confusing. */}
+              {mode !== 'reset' && (
+                <label className="block">
+                  <span className="micro-label">PASSWORD</span>
+                  <input
+                    type="password"
+                    required
+                    minLength={6}
+                    autoComplete={
+                      mode === 'signin' ? 'current-password' : 'new-password'
+                    }
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    className="input-bare mt-2"
+                  />
+                </label>
+              )}
+
+              {/* "Forgot password?" only appears in sign-in mode —
+                  in reset mode the user is already on that flow, and
+                  in signup mode there's no account to recover yet.
+                  Sits as a small quiet link under the password field,
+                  matching the underline-link idiom of action-primary
+                  but at body size and in ink-400. */}
+              {mode === 'signin' && (
+                <div className="-mt-4">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode('reset');
+                      setError(null);
+                      setInfo(null);
+                    }}
+                    className="text-small text-ink-400 underline-offset-4
+                               transition-colors duration-180 ease-out
+                               hover:text-ink-50 hover:underline
+                               focus:outline-none focus-visible:text-ink-50
+                               focus-visible:underline"
+                  >
+                    Forgot password?
+                  </button>
+                </div>
+              )}
 
               {/* Error and info messages. We keep them out of the
                   form's vertical rhythm (mt-6) so the layout
@@ -206,7 +250,10 @@ export function AuthScreen() {
                   the link visible (rather than swapping to a
                   spinner) because the action takes under a second
                   and a spinner would feel heavier than the moment
-                  deserves. */}
+                  deserves. In reset mode the label changes to
+                  "Send reset link" and we expose a "Back to
+                  sign in" link opposite it so the user can bail
+                  out without waiting for the email. */}
               <div className="mt-2 flex items-center justify-between">
                 <button
                   type="submit"
@@ -218,13 +265,29 @@ export function AuthScreen() {
                     ? 'Working…'
                     : mode === 'signin'
                       ? 'Sign in'
-                      : 'Create account'}
+                      : mode === 'signup'
+                        ? 'Create account'
+                        : 'Send reset link'}
                   <ArrowRightIcon size={14} className="opacity-60" />
                 </button>
 
-                {/* The "forgot password" link is intentionally not
-                    here yet — Supabase reset is wired in
-                    lib/auth.ts and we can drop it in next pass. */}
+                {mode === 'reset' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMode('signin');
+                      setError(null);
+                      setInfo(null);
+                    }}
+                    className="text-small text-ink-500 underline-offset-4
+                               transition-colors duration-180 ease-out
+                               hover:text-ink-200 hover:underline
+                               focus:outline-none focus-visible:text-ink-50
+                               focus-visible:underline"
+                  >
+                    Back to sign in
+                  </button>
+                )}
               </div>
             </form>
 

@@ -21,6 +21,7 @@ import { ControlBar } from './components/ControlBar';
 import { ChatPanel } from './components/ChatPanel';
 import { ParticipantSidebar } from './components/ParticipantSidebar';
 import { WaitingScreen, WaitingRoomPanel } from './components/WaitingRoom';
+import { ResetPassword } from './components/ResetPassword';
 import { MAX_PARTICIPANTS } from './types';
 import { buildInviteLink } from './lib/inviteLink';
 import { ChevronDownIcon } from './components/Icons';
@@ -167,6 +168,16 @@ export default function App() {
     );
   }
 
+  // Password-recovery landing page. We check this before the
+  // auth-state branching so a signed-out user who clicks the
+  // email link can still finish the reset. Supabase puts the
+  // one-time token in the URL hash, which the client picks up
+  // on its own; the ResetPassword screen listens for the
+  // PASSWORD_RECOVERY event and updates the user's password.
+  if (window.location.pathname === '/reset-password') {
+    return <ResetPassword />;
+  }
+
   return (
     // No outer padding or background color on the root — both
     // pages set their own. The field color is on body, so a flash
@@ -193,9 +204,9 @@ export default function App() {
               TOP BAR
               ---------------------------------------------------------------- */}
           <header
-            className="flex flex-shrink-0 items-center justify-between
-                       border-b border-white/[0.06] bg-field/80
-                       px-6 py-3 backdrop-blur-md"
+            className="relative z-50 flex flex-shrink-0 items-center
+                       justify-between border-b border-white/[0.06]
+                       bg-field/80 px-6 py-3 backdrop-blur-md"
           >
             <div className="flex items-center gap-6 text-small">
               {/* Wordmark + room id. Mono for the room id so it

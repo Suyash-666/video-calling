@@ -74,9 +74,13 @@ export function ParticipantSidebar({
         {participants.map((p) => (
           <li
             key={p.id}
-            className="flex items-center gap-4 rounded px-3 py-3
+            className={`flex items-center gap-4 rounded px-3 py-3
                        outline-none transition-colors duration-180
-                       ease-out hover:bg-white/[0.02]"
+                       ease-out hover:bg-white/[0.02] ${
+                         p.handRaised
+                           ? 'bg-accent/10 ring-1 ring-accent/30'
+                           : ''
+                       }`}
           >
             {/* Monogram avatar. The letter is set in mono small-
                 caps so two-letter monograms align vertically. */}
@@ -119,28 +123,40 @@ export function ParticipantSidebar({
               )}
             </div>
 
-            {/* Status icons. Color carries the meaning: ink-50
-                when on, state-error when off. The icons are
-                the 16x16 stroked SVGs from ./Icons. */}
+            {/* Status icons. Only three glyphs are shown:
+                  - hand, only when raised (in accent color)
+                  - mic, swapped on/off based on p.micOn
+                  - camera, swapped on/off based on p.camOn
+                Each glyph is wired to live data from the participant
+                row, so it flips the moment the underlying flag
+                changes — no caching, no debounce. We deliberately
+                do NOT show a phone / call icon here: the user is
+                in the participants list because they are in the
+                call, and a call-state icon was duplicative (and
+                read like a "hang up" affordance). */}
             <div className="flex flex-shrink-0 items-center gap-3
                             text-ink-400">
               {p.handRaised && (
                 <span
                   className="text-accent"
                   aria-label={`${p.name} has their hand raised`}
+                  title="Hand raised"
                 >
                   <HandIcon size={14} />
                 </span>
               )}
+
               <span
                 className={p.micOn ? 'text-ink-200' : 'text-state-error'}
                 title={p.micOn ? 'Mic on' : 'Mic muted'}
+                aria-label={p.micOn ? 'Microphone on' : 'Microphone muted'}
               >
                 {p.micOn ? <MicIcon size={14} /> : <MicOffIcon size={14} />}
               </span>
               <span
                 className={p.camOn ? 'text-ink-200' : 'text-state-error'}
                 title={p.camOn ? 'Camera on' : 'Camera off'}
+                aria-label={p.camOn ? 'Camera on' : 'Camera off'}
               >
                 {p.camOn ? <VideoIcon size={14} /> : <VideoOffIcon size={14} />}
               </span>

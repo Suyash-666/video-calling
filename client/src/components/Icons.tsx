@@ -123,6 +123,31 @@ export const HangupIcon = (p: IconProps) =>
     p
   );
 
+// Phone-in-call icon: a tilted receiver with two short sound waves.
+// Used by the participant sidebar to indicate the user is actively
+// in the call (mirrors HangupIcon's tilt so the two read as a pair).
+export const PhoneIcon = (p: IconProps) =>
+  svg(
+    <g transform="rotate(135 12 12)">
+      <path d="M5.5 4.78a2 2 0 0 1 2.32-.42l2.4 1.2a2 2 0 0 1 1.06 2.16l-.6 2.4a2 2 0 0 0 .55 1.95l3.4 3.4a2 2 0 0 0 1.95.55l2.4-.6a2 2 0 0 1 2.16 1.06l1.2 2.4a2 2 0 0 1-.42 2.32l-1.5 1.34a3 3 0 0 1-3.4.36 16 16 0 0 1-7.6-7.6 3 3 0 0 1 .36-3.4z" />
+      <path d="M16 4l2 2" />
+      <path d="M19 7l1.5 1.5" />
+    </g>,
+    p
+  );
+
+// Phone-off: receiver at the same tilt as PhoneIcon, with a strike
+// through it. Used to indicate the participant is *not* in an
+// active call (e.g. dialed in but not yet connected, or briefly
+// disconnected mid-call).
+export const PhoneOffIcon = (p: IconProps) =>
+  svg(
+    <g transform="rotate(135 12 12)">
+      <path d="M5.5 4.78a2 2 0 0 1 2.32-.42l2.4 1.2a2 2 0 0 1 1.06 2.16l-.6 2.4a2 2 0 0 0 .55 1.95l3.4 3.4a2 2 0 0 0 1.95.55l2.4-.6a2 2 0 0 1 2.16 1.06l1.2 2.4a2 2 0 0 1-.42 2.32l-1.5 1.34a3 3 0 0 1-3.4.36 16 16 0 0 1-7.6-7.6 3 3 0 0 1 .36-3.4z" />
+    </g>,
+    p
+  );
+
 export const HandIcon = (p: IconProps) =>
   svg(
     <>

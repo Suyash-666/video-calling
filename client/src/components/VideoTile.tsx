@@ -91,18 +91,35 @@ export function VideoTile({
                       bottom-0 h-20 bg-gradient-to-t
                       from-black/40 to-transparent" />
 
-      {/* Raised-hand badge — a 6px amber dot in the top-right.
-          The pulse uses the .live-dot keyframe. No emoji. */}
+      {/* Raised-hand badge — a prominent amber pill in the top-right
+          with the hand icon and label, plus a pulsing live dot. We
+          scale it up (vs. the previous micro-pill) so it's visible
+          at a glance across the grid, and add a soft amber ring
+          around the whole tile so a raised hand is unmissable even
+          from the corner of the eye. The ring uses a CSS animation
+          defined alongside the reactionFloat keyframes below. */}
       {handRaised && (
-        <span
-          className="absolute right-3 top-3 flex items-center gap-2
-                     rounded-full bg-accent/15 px-2 py-1
-                     text-small text-accent"
-          aria-label="Hand raised"
-        >
-          <span className="live-dot" />
-          Hand
-        </span>
+        <>
+          <span
+            className="pointer-events-none absolute inset-0
+                       rounded ring-2 ring-accent/70
+                       hand-ring"
+            aria-hidden="true"
+          />
+          <span
+            className="absolute right-3 top-3 z-10 flex
+                       items-center gap-2 rounded-full
+                       bg-accent px-3 py-1.5 text-small
+                       font-medium text-field shadow-md
+                       shadow-accent/20"
+            aria-label="Hand raised"
+          >
+            <HandGlyph />
+            <span className="font-mono uppercase tracking-wide">
+              Hand
+            </span>
+          </span>
+        </>
       )}
 
       {/* Reaction overlay — emojis float up from the bottom and
@@ -141,6 +158,14 @@ export function VideoTile({
           80%  { transform: translateY(-160px) scale(1);  opacity: 1; }
           100% { transform: translateY(-200px) scale(0.9); opacity: 0; }
         }
+        @keyframes handRing {
+          0%   { box-shadow: 0 0 0 0   rgba(255, 180, 84, 0.55); }
+          70%  { box-shadow: 0 0 0 10px rgba(255, 180, 84, 0);    }
+          100% { box-shadow: 0 0 0 0   rgba(255, 180, 84, 0);    }
+        }
+        .hand-ring {
+          animation: handRing 1.6s ease-out infinite;
+        }
       `}</style>
     </div>
   );
@@ -155,4 +180,28 @@ function hashTo01(s: string): number {
     h = (h * 31 + s.charCodeAt(i)) | 0;
   }
   return ((h >>> 0) % 1000) / 1000;
+}
+
+// Inline hand glyph for the raised-hand badge. Same visual language
+// as the Icons module's HandIcon, but tinted to sit on the accent
+// fill (dark) rather than on the field (light).
+function HandGlyph() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M18 11V6a2 2 0 0 0-4 0v5" />
+      <path d="M14 10V4a2 2 0 0 0-4 0v6" />
+      <path d="M10 10.5V6a2 2 0 0 0-4 0v8" />
+      <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15" />
+    </svg>
+  );
 }
