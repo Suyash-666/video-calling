@@ -8,12 +8,19 @@
 
 import { useEffect, useRef, useState } from 'react';
 import type { ChatMessage } from '../types';
+import type { Participant } from '../types';
 import { CloseIcon } from './Icons';
 
 interface Props {
   open: boolean;
   messages: ChatMessage[];
   loading: boolean;
+  // Live participants list (self + remotes). Used to look up the
+  // sender's display name from a message's userId. If a message's
+  // author isn't in the list (e.g. they left before you opened the
+  // panel, or you're looking at history from a much earlier
+  // session), we fall back to a short id prefix.
+  participants: Participant[];
   onSend: (text: string) => void;
   onClose: () => void;
 }
@@ -23,9 +30,20 @@ function formatTime(at: number) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-export function ChatPanel({ open, messages, loading, onSend, onClose }: Props) {
+export function ChatPanel({ open, messages, loading, participants, onSend, onClose }: Props) {
   const [draft, setDraft] = useState('');
   const listRef = useRef<HTMLDivElement | null>(null);
+
+  // Build a userId -> display name lookup from the live participants
+  // list. Recomputed on every render — participants is a small array
+  // (max MAX_PARTICIPANTS) and this is cheaper than maintaining a
+  // separate ref + memo.
+  const nameFor = (userId: string, isMe: boolean): string => {
+    if (isMe) return 'You';
+    const p = participants.find((x) => x.id === userId);
+    if (p?.name) return p.name;
+    return userId.slice(0, 6);
+  };
 
   // Auto-scroll to the newest message whenever the list grows.
   useEffect(() => {
@@ -89,29 +107,44 @@ export function ChatPanel({ open, messages, loading, onSend, onClose }: Props) {
               No messages yet. Say hi.
             </p>
           )}
-          {messages.map((m) => (
-            <div
-              key={m.id}
-              className={`flex ${isMe(m) ? 'justify-end' : 'justify-start'}`}
-            >
+          {messages.map((m) => {
+            const mine = isMe(m);
+            return (
               <div
-                className={`max-w-[80%] rounded-md px-3 py-2
-                            ${isMe(m)
-                              ? 'border border-accent/30 bg-accent/5 text-ink-50'
-                              : 'border border-white/[0.06] bg-surface text-ink-200'}`}
+                key={m.id}
+                className={`flex ${mine ? 'justify-end' : 'justify-start'}`}
               >
-                <p className="whitespace-pre-wrap break-words text-small">
-                  {m.text}
-                </p>
-                <p
-                  className={`mt-1 font-mono text-[10px]
-                              ${isMe(m) ? 'text-accent/70' : 'text-ink-500'}`}
+                <div
+                  className={`max-w-[80%] rounded-md px-3 py-2
+                              ${mine
+                                ? 'border border-accent/30 bg-accent/5 text-ink-50'
+                                : 'border border-white/[0.06] bg-surface text-ink-200'}`}
                 >
-                  {formatTime(m.at)}
-                </p>
+                  {/* Sender line: the author's name, then a small time
+                      stamp on the right. Kept on a single line so the
+                      message body underneath flows naturally. */}
+                  <div className="mb-1 flex items-baseline justify-between
+                                  gap-3">
+                    <span
+                      className={`text-[11px] font-medium
+                                  ${mine ? 'text-accent' : 'text-ink-100'}`}
+                    >
+                      {nameFor(m.userId, mine)}
+                    </span>
+                    <span
+                      className={`font-mono text-[10px]
+                                  ${mine ? 'text-accent/60' : 'text-ink-500'}`}
+                    >
+                      {formatTime(m.at)}
+                    </span>
+                  </div>
+                  <p className="whitespace-pre-wrap break-words text-small">
+                    {m.text}
+                  </p>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         <form

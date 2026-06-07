@@ -472,6 +472,7 @@ export default function App() {
             open={chatOpen}
             messages={chat}
             loading={chatLoading}
+            participants={participants}
             onSend={sendChat}
             onClose={() => setChatOpen(false)}
           />
