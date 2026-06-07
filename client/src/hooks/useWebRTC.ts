@@ -402,6 +402,22 @@ export function useWebRTC(): UseWebRTCResult {
           'gatheringState:',
           pc.iceGatheringState
         );
+        // The classic 'works for 30s, then drops' symptom. The WebRTC
+        // spec says `disconnected` is recoverable: we can ask the
+        // browser to gather fresh candidates via restartIce() and
+        // re-negotiate without closing the PC. The spec also says
+        // *we* have ~5s to react before the browser gives up and
+        // transitions to `failed` — so we restart immediately.
+        if (pc.iceConnectionState === 'disconnected') {
+          try {
+            pc.restartIce();
+            // eslint-disable-next-line no-console
+            console.log('[zoom-mini] restartIce()', peerId.slice(0, 6));
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn('[zoom-mini] restartIce failed', e);
+          }
+        }
       };
 
       pc.onconnectionstatechange = () => {
@@ -415,6 +431,25 @@ export function useWebRTC(): UseWebRTCResult {
           pc.connectionState
         );
         bumpPeerTick();
+      };
+
+      // restartIce() above triggers onnegotiationneeded on the side
+      // that owns the offer (smaller userId per our caller-id rule).
+      // When that fires, send a fresh offer with new ICE credentials
+      // so the other side can re-establish the connection.
+      pc.onnegotiationneeded = async () => {
+        if (selfId >= peerId) return; // answerer side
+        if (pc.signalingState !== 'stable') return;
+        try {
+          const offer = await pc.createOffer({ iceRestart: true });
+          await pc.setLocalDescription(offer);
+          sendSignal('offer', peerId, { sdp: offer });
+          // eslint-disable-next-line no-console
+          console.log('[zoom-mini] iceRestart offer sent', peerId.slice(0, 6));
+        } catch (e: any) {
+          // eslint-disable-next-line no-console
+          console.warn('[zoom-mini] iceRestart offer failed', e?.message ?? e);
+        }
       };
 
       // The answerer side receives the data channel that the offerer
