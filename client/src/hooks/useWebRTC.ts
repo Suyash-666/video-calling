@@ -123,6 +123,43 @@ function displayNameFor(
   return user.id.slice(0, 6);
 }
 
+// Confirms the caller is a member of the room before we open the
+// realtime channel. The realtime RLS policy in
+// 0005_realtime_per_channel_auth.sql gates broadcast/presence on
+// `is_room_member(room_id)`. If the membership row was just written
+// (e.g. via `create_room_with_host` or `approve_join` in the same
+// transaction as the RPC the client just awaited), the row IS
+// committed by the time we get here — but on rare occasions the
+// realtime RLS evaluator in a different session can lag a few
+// hundred milliseconds. We poll for up to ~2.5s (six tries with
+// linear backoff) so the channel open never races the membership
+// visibility. Without this, the symptom was: the joining user
+// publishes presence (succeeds), but the OTHER peers' realtime
+// connection refuses to deliver the broadcast/presence diffs from
+// the joiner (RLS on their side returns false), so neither side
+// sees the other — even though both are in `room_members`.
+// We do the check by reading `room_members` directly (also gated
+// by RLS, but as the same caller that just wrote the row), which
+// mirrors what the realtime RLS does and surfaces the same
+// visibility state to the client.
+async function verifyMembership(
+  roomId: string,
+  expectedUserId: string
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const { data, error } = await supabase
+      .from('room_members')
+      .select('user_id')
+      .eq('room_id', roomId)
+      .eq('user_id', expectedUserId)
+      .maybeSingle();
+    if (!error && data) return true;
+    // Linear backoff: 200, 400, 600, 800, 1000, 1200ms.
+    await new Promise((r) => window.setTimeout(r, 200 * (attempt + 1)));
+  }
+  return false;
+}
+
 // crypto.randomUUID is the cleanest portable id generator; the lib types
 // in older TS may not surface it on `Crypto`, so we cast pragmatically.
 function uuid(): string {
@@ -398,6 +435,22 @@ export function useWebRTC(): UseWebRTCResult {
     void publishPresence();
   }, [publishPresence]);
 
+  // Periodic republish: a low-frequency safety net that re-sends the
+  // current presence row so any transient Supabase Realtime glitch
+  // (a missed diff, a brief WebSocket drop, an `inPendingSyncState`
+  // window on the receiver) self-heals within a few seconds. Realtime
+  // is reliable in steady state; this is for the failure modes the
+  // debug logs surface. 4 s is short enough to feel "live" but long
+  // enough to not flood the channel — the user can hand-raise / mute
+  // in the gap and get the immediate republish on top.
+  useEffect(() => {
+    if (status !== 'in-call') return;
+    const t = window.setInterval(() => {
+      void publishPresence();
+    }, 4000);
+    return () => window.clearInterval(t);
+  }, [status, publishPresence]);
+
   // --- Signaling + presence handlers ---------------------------------------
   const attachSignaling = useCallback(
     (ch: RealtimeChannel) => {
@@ -528,8 +581,26 @@ export function useWebRTC(): UseWebRTCResult {
       );
 
       // --- Presence -------------------------------------------------------
+      //
+      // We listen to BOTH `sync` and `join` and route them through
+      // the same refresh helper. The reasoning:
+      //
+      //   - `sync` fires whenever the local presenceState is
+      //     recomputed server-side. It covers joins AND leaves
+      //     AND any peer republishing their row.
+      //   - `join` fires the moment a new peer publishes their
+      //     first track, with the just-joined row as the payload.
+      //     Crucially, some Realtime deployments only deliver
+      //     `join` to the existing peers without an accompanying
+      //     `sync` — in which case presenceState() never updates
+      //     and the existing peers don't see the new joiner.
+      //     Routing `join` through the same refresh path makes
+      //     us robust to that delivery shape.
+      //
+      // The helper re-reads presenceState() in both cases, so we
+      // don't depend on the payload being complete.
 
-      ch.on('presence', { event: 'sync' }, () => {
+      const refreshPresence = () => {
         const state = ch.presenceState();
         // Dedup by user id. presenceState returns { presenceKey -> rows[] }
         // and a single tab is normally one key, but transient
@@ -582,13 +653,67 @@ export function useWebRTC(): UseWebRTCResult {
         if (!media) return;
 
         for (const existingId of Array.from(peersRef.current.keys())) {
-          if (!presentIds.has(existingId)) removePeer(existingId);
+          if (presentIds.has(existingId)) {
+            // Peer is back (or never left) — cancel any pending tear-down
+            // scheduled by a prior transient gap in presence.
+            const e = peersRef.current.get(existingId);
+            if (e && (e as any)._leaveTimer != null) {
+              window.clearTimeout((e as any)._leaveTimer);
+              (e as any)._leaveTimer = null;
+            }
+            continue;
+          }
+          const e = peersRef.current.get(existingId);
+          if (!e) continue;
+          // Don't tear down immediately on a presence gap. Realtime
+          // can briefly omit a peer's row during republish, and a
+          // peer-connection rebuild is expensive (offer/answer/ICE all
+          // over again). Wait 3s of confirmed absence before we close.
+          if ((e as any)._leaveTimer != null) continue;
+          (e as any)._leaveTimer = window.setTimeout(() => {
+            const stillGone = !ch
+              .presenceState()
+              // presenceState() returns { key -> PresenceRow[] }; flatten.
+              ? true
+              : !Object.values(ch.presenceState())
+                  .flat()
+                  .some((row: any) => row?.id === existingId);
+            if (stillGone) {
+              removePeer(existingId);
+            } else {
+              const ent = peersRef.current.get(existingId);
+              if (ent) (ent as any)._leaveTimer = null;
+            }
+          }, 3000);
         }
         for (const peerId of presentIds) {
-          if (peersRef.current.has(peerId)) continue;
+          if (peersRef.current.has(peerId)) {
+            // Peer we thought we knew came back. If the connection
+            // state is `failed` or `closed`, kick a fresh offer.
+            const e = peersRef.current.get(peerId);
+            if (
+              e &&
+              (e.pc.connectionState === 'failed' ||
+                e.pc.connectionState === 'closed') &&
+              selfId < peerId
+            ) {
+              void callPeer(peerId);
+            }
+            continue;
+          }
           createPeerFor(peerId, media);
           if (selfId < peerId) void callPeer(peerId);
         }
+      };
+
+      ch.on('presence', { event: 'sync' }, refreshPresence);
+      // The `join` payload is just the new row(s); we ignore it and
+      // re-derive from presenceState() so the merge logic stays in
+      // one place.
+      ch.on('presence', { event: 'join' }, (payload: any) => {
+        // eslint-disable-next-line no-console
+        console.log('[zoom-mini] presence join', payload);
+        refreshPresence();
       });
 
       ch.on('presence', { event: 'leave' }, ({ leftPresences }) => {
@@ -601,7 +726,9 @@ export function useWebRTC(): UseWebRTCResult {
           if (a && a.leftAt === null) {
             a.leftAt = Date.now();
           }
-          removePeer(p.id);
+          // Defer teardown — the next `sync` will confirm the leave and
+          // run the 3s grace timer. We still show the system "left"
+          // message immediately so the UI doesn't feel laggy.
           setChat((prev) => [
             ...prev,
             {
@@ -695,6 +822,19 @@ export function useWebRTC(): UseWebRTCResult {
     async (id: string, mode: 'host' | 'guest') => {
       setRole(mode);
 
+      // Confirm the membership is visible to the same RLS path the
+      // realtime server uses before we open the channel. If the row
+      // isn't visible yet, the realtime subscription would silently
+      // receive no peer messages and the joiner would appear alone.
+      const isMember = await verifyMembership(id, selfId);
+      if (!isMember) {
+        setError(
+          'Could not confirm your membership in this room. Try rejoining.'
+        );
+        setStatus('error');
+        return;
+      }
+
       await startLocalMedia();
       // Presence key combines user id + a per-tab nonce so:
       //   - the same user in two tabs counts as two participants
@@ -713,7 +853,7 @@ export function useWebRTC(): UseWebRTCResult {
             // the same value on every later track() so the row updates
             // in place instead of looking like a re-join.
             joinedAtRef.current = Date.now();
-            await ch.track({
+            const row: PresenceRow = {
               id: selfId,
               name: selfName,
               isHost: mode === 'host',
@@ -721,8 +861,28 @@ export function useWebRTC(): UseWebRTCResult {
               camOn: true,
               handRaised: false,
               joinedAt: joinedAtRef.current,
-            } satisfies PresenceRow);
+            };
+            // eslint-disable-next-line no-console
+            console.log('[zoom-mini] presence subscribed', {
+              room: id,
+              mode,
+              selfId,
+              row,
+            });
+            try {
+              const ack = await ch.track(row);
+              // eslint-disable-next-line no-console
+              console.log('[zoom-mini] presence track ack', ack);
+            } catch (e) {
+              // eslint-disable-next-line no-console
+              console.warn('[zoom-mini] presence track failed', e);
+            }
             setStatus('in-call');
+            // Clear any stale error from a previous join attempt so
+            // a successful re-entry doesn't keep the red error chip
+            // on screen. The error UI lives in App.tsx and reads
+            // from `error`, so a single setError(null) is enough.
+            setError(null);
             // Analytics: stamp the call's start time and seed our own
             // participant record. Host-only — guests don't write sessions.
             if (mode === 'host') {
@@ -752,12 +912,25 @@ export function useWebRTC(): UseWebRTCResult {
 
       // Load the room's waiting-room flag so the host UI can render the
       // toggle in the correct state. RLS lets members SELECT the row.
-      const { data: roomRow } = await supabase
-        .from('rooms')
-        .select('waiting_room_enabled')
-        .eq('id', id)
-        .maybeSingle();
-      setWaitingRoomEnabledState(!!roomRow?.waiting_room_enabled);
+      // The policy `members can read their room` calls is_room_member,
+      // which returns true the moment the host's create_room_with_host
+      // (or the guest's approve_join) committed. We retry briefly to
+      // absorb any replication lag right after an approval.
+      let waitingFlag = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const { data: roomRow } = await supabase
+          .from('rooms')
+          .select('waiting_room_enabled')
+          .eq('id', id)
+          .maybeSingle();
+        if (roomRow) {
+          waitingFlag = !!roomRow.waiting_room_enabled;
+          break;
+        }
+        // small linear backoff (200ms, 400ms)
+        await new Promise((r) => window.setTimeout(r, 200 * (attempt + 1)));
+      }
+      setWaitingRoomEnabledState(waitingFlag);
 
       // Host-only: subscribe to incoming join requests and prime with any
       // already-pending rows. Guests do not need this stream.
@@ -981,6 +1154,14 @@ export function useWebRTC(): UseWebRTCResult {
   }, []);
 
   // Host toggle: flip waiting room on/off for the current room.
+  // IMPORTANT: this only affects FUTURE redemptions of the invite
+  // token. Guests who are already in the room (their membership
+  // row exists) stay in the room — the realtime channels, peer
+  // connections, and chat subscriptions are NOT torn down by this
+  // toggle. (We deliberately do not call removeAllChannels() or
+  // close peer connections here; the previous version did neither
+  // either, but the comment makes the invariant explicit so a
+  // future change doesn't accidentally regress it.)
   const setWaitingRoomEnabled = useCallback(
     async (enabled: boolean) => {
       const id = roomIdRef.current;
@@ -995,7 +1176,24 @@ export function useWebRTC(): UseWebRTCResult {
         setError(`Could not change waiting room: ${err.message}`);
         // Roll back the optimistic state.
         setWaitingRoomEnabledState(!enabled);
+        return;
       }
+      // Surface the toggle in the chat so everyone can see it. This
+      // also makes it obvious when the host changed the setting
+      // mid-call (the only existing visible signal was the tiny
+      // "On/Off" label next to the checkbox).
+      setChat((prev) => [
+        ...prev,
+        {
+          id: `sys-${Date.now()}-waiting`,
+          userId: 'system',
+          from: 'peer',
+          text: enabled
+            ? 'Waiting room turned on — new guests will be approved before joining.'
+            : 'Waiting room turned off — new guests join immediately.',
+          at: Date.now(),
+        },
+      ]);
     },
     []
   );
@@ -1146,8 +1344,30 @@ export function useWebRTC(): UseWebRTCResult {
   // this, the camera LED can stay lit for a few seconds after the tab
   // closes on some platforms (the device handle outlives the JS
   // process until the OS reaps it).
+  //
+  // IMPORTANT: `pagehide` fires on EVERY visibility loss, including
+  // switching tabs and minimizing the window on some browsers. If we
+  // tear down the realtime channels on every pagehide, the user gets
+  // a "the other side just left" blip whenever they briefly look at
+  // another tab. The teardown should only happen on a *real* page
+  // unload, which is signalled by `event.persisted === false` on
+  // `pagehide` AND the absence of an `onFreeze` / `onResume` cycle
+  // (i.e. the page is being discarded, not frozen). We use the
+  // `visibilitychange` event in tandem: a real unload is the
+  // pagehide that fires with `document.visibilityState === 'hidden'`
+  // AND no subsequent `visibilitychange` to 'visible' within ~250ms.
+  // For simplicity and reliability we just check `persisted`: a
+  // persisted pagehide means "this page might come back" (bfcache) so
+  // we leave the channels alone. Only an un-persisted pagehide tears
+  // things down. This keeps the call alive across tab switches.
   useEffect(() => {
-    const onPageHide = () => {
+    const onPageHide = (e: Event) => {
+      // If the page is being put in bfcache, do nothing — the browser
+      // may restore it, and tearing down the channel would force
+      // everyone to re-handshake on resume.
+      // `persisted` is only on PageTransitionEvent; cast to read it.
+      const persisted = (e as PageTransitionEvent).persisted;
+      if (persisted) return;
       // Synchronous, best-effort. We deliberately do NOT use a Promise
       // here — pagehide handlers have a tight time budget and the
       // browser won't wait for an awaited teardown.
@@ -1204,7 +1424,17 @@ export function useWebRTC(): UseWebRTCResult {
 
   const toggleHand = useCallback(() => {
     setHandRaised((h) => !h);
-  }, []);
+    // The effect-driven republish in `publishPresence` will fire on
+    // the next render, but we trigger an explicit republish
+    // immediately so the hand state lands in the realtime channel
+    // within the same animation frame as the click — important for
+    // a gesture that should feel "instant" to the other side.
+    // Republish is queued off the next microtask so the React state
+    // has flushed and `publishPresence` reads the new value.
+    queueMicrotask(() => {
+      void publishPresence();
+    });
+  }, [publishPresence]);
 
   const lowerAllHands = useCallback(() => {
     const ch = channelRef.current;
@@ -1219,7 +1449,27 @@ export function useWebRTC(): UseWebRTCResult {
     });
     // Also drop our own immediately (the broadcast doesn't echo to self).
     setHandRaised(false);
-  }, [role, selfId]);
+    // Surface the action in chat so everyone knows the host reset
+    // the queue — without this, the only visible signal is the
+    // badges disappearing, which can be subtle across a multi-tile
+    // grid.
+    setChat((prev) => [
+      ...prev,
+      {
+        id: `sys-${Date.now()}-hands`,
+        userId: 'system',
+        from: 'peer',
+        text: 'The host lowered all hands.',
+        at: Date.now(),
+      },
+    ]);
+    // Republish our own presence so the row reflects the new
+    // handRaised=false immediately for any peer that joins in the
+    // next few seconds.
+    queueMicrotask(() => {
+      void publishPresence();
+    });
+  }, [role, selfId, publishPresence]);
 
   const sendReaction = useCallback(
     (emoji: ReactionEmoji) => {
