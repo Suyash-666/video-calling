@@ -776,6 +776,10 @@ export function useWebRTC(): UseWebRTCResult {
         }
       };
 
+      ch.on('status', {}, (status: any) => {
+        console.log('[zoom-mini] REALTIME CHANNEL STATUS', status);
+      });
+
       ch.on('broadcast', { event: 'offer' }, onOffer as any);
       ch.on('broadcast', { event: 'answer' }, onAnswer as any);
       ch.on('broadcast', { event: 'ice-candidate' }, onIce as any);
