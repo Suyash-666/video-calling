@@ -367,6 +367,19 @@ export function useWebRTC(): UseWebRTCResult {
       peersRef.current.set(peerId, entry);
 
       pc.ontrack = (ev) => {
+        console.log('[zoom-mini] REMOTE TRACK FIRED', peerId.slice(0, 6), {
+          kind: ev.track.kind,
+          id: ev.track.id,
+          readyState: ev.track.readyState,
+          streams: ev.streams.map((st) => ({
+            id: st.id,
+            tracks: st.getTracks().map((t) => ({
+              kind: t.kind,
+              id: t.id,
+              readyState: t.readyState,
+            })),
+          })),
+        });
         const e = peersRef.current.get(peerId);
         if (!e) return;
         console.log('[zoom-mini] REMOTE TRACK', peerId.slice(0, 6), {
