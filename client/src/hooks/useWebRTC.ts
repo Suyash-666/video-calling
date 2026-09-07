@@ -909,13 +909,41 @@ export function useWebRTC(): UseWebRTCResult {
       };
 
       ch.on('presence', { event: 'sync' }, refreshPresence);
-      // The `join` payload is just the new row(s); we ignore it and
-      // re-derive from presenceState() so the merge logic stays in
-      // one place.
+
+      // Realtime can deliver the `join` event before `presenceState()` has
+      // been refreshed locally. Use the actual join payload immediately,
+      // then reconcile from presenceState() on the next tick.
       ch.on('presence', { event: 'join' }, (payload: any) => {
         // eslint-disable-next-line no-console
         console.log('[zoom-mini] presence join', payload);
-        refreshPresence();
+
+        const joined = [
+          ...(payload?.newPresences ?? []),
+          ...(payload?.joins ?? []),
+          ...(payload?.currentPresences ?? []),
+        ] as PresenceRow[];
+
+        if (joined.length > 0) {
+          setPresenceRows((prev) => {
+            const map = new Map<string, PresenceRow>(
+              prev.map((row) => [row.id, row])
+            );
+
+            for (const row of joined) {
+              if (!row?.id || row.id === selfId) continue;
+              const existing = map.get(row.id);
+              if (!existing || (row.joinedAt ?? 0) >= (existing.joinedAt ?? 0)) {
+                map.set(row.id, row);
+              }
+            }
+
+            return Array.from(map.values());
+          });
+        }
+
+        // Let Realtime finish its local presence-state update before the
+        // normal mesh reconciliation runs.
+        window.setTimeout(() => refreshPresence(), 0);
       });
 
       ch.on('presence', { event: 'leave' }, ({ leftPresences }) => {
