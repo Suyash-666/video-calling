@@ -79,6 +79,7 @@ interface PeerEntry {
   remoteStream: MediaStream;
   hasMedia: boolean;
   connectionState: RTCPeerConnectionState;
+  pendingIceCandidates: RTCIceCandidateInit[];
 }
 
 // How the user is joining a room, used to choose the right RPC.
@@ -354,6 +355,7 @@ export function useWebRTC(): UseWebRTCResult {
         remoteStream,
         hasMedia: false,
         connectionState: pc.connectionState,
+        pendingIceCandidates: [],
       };
       // Expose the timer to removePeer() so teardown can stop it.
       // Re-set it once the channel actually opens.
@@ -407,15 +409,30 @@ export function useWebRTC(): UseWebRTCResult {
         // re-negotiate without closing the PC. The spec also says
         // *we* have ~5s to react before the browser gives up and
         // transitions to `failed` — so we restart immediately.
-        if (pc.iceConnectionState === 'disconnected') {
-          try {
-            pc.restartIce();
-            // eslint-disable-next-line no-console
-            console.log('[zoom-mini] restartIce()', peerId.slice(0, 6));
-          } catch (e) {
-            // eslint-disable-next-line no-console
-            console.warn('[zoom-mini] restartIce failed', e);
-          }
+        if (
+          pc.iceConnectionState === 'disconnected' &&
+          selfId < peerId &&
+          pc.signalingState === 'stable'
+        ) {
+          void (async () => {
+            try {
+              const offer = await pc.createOffer({ iceRestart: true });
+              await pc.setLocalDescription(offer);
+              sendSignal('offer', peerId, { sdp: offer });
+              // eslint-disable-next-line no-console
+              console.log(
+                '[zoom-mini] explicit ICE restart offer sent',
+                peerId.slice(0, 6)
+              );
+            } catch (e) {
+              // eslint-disable-next-line no-console
+              console.warn(
+                '[zoom-mini] explicit ICE restart failed',
+                peerId.slice(0, 6),
+                e
+              );
+            }
+          })();
         }
       };
 
@@ -606,6 +623,25 @@ export function useWebRTC(): UseWebRTCResult {
           await entry.pc.setRemoteDescription(
             new RTCSessionDescription(payload.sdp)
           );
+
+          // ICE candidates can arrive before the offer. Keep them queued
+          // until the remote description exists, then add them in order.
+          if (entry.pendingIceCandidates.length > 0) {
+            const queued = entry.pendingIceCandidates.splice(0);
+            for (const candidate of queued) {
+              try {
+                await entry.pc.addIceCandidate(new RTCIceCandidate(candidate));
+              } catch (iceError) {
+                // eslint-disable-next-line no-console
+                console.warn(
+                  '[zoom-mini] queued ICE candidate failed',
+                  payload.from.slice(0, 6),
+                  iceError
+                );
+              }
+            }
+          }
+
           const answer = await entry.pc.createAnswer();
           await entry.pc.setLocalDescription(answer);
           sendSignal('answer', payload.from, { sdp: answer });
@@ -636,6 +672,22 @@ export function useWebRTC(): UseWebRTCResult {
           await entry.pc.setRemoteDescription(
             new RTCSessionDescription(payload.sdp)
           );
+
+          if (entry.pendingIceCandidates.length > 0) {
+            const queued = entry.pendingIceCandidates.splice(0);
+            for (const candidate of queued) {
+              try {
+                await entry.pc.addIceCandidate(new RTCIceCandidate(candidate));
+              } catch (iceError) {
+                // eslint-disable-next-line no-console
+                console.warn(
+                  '[zoom-mini] queued ICE candidate failed',
+                  entry.pc.remoteDescription?.type ?? 'unknown',
+                  iceError
+                );
+              }
+            }
+          }
         } catch (e: any) {
           setError(`Answer handling failed: ${e?.message ?? e}`);
         }
@@ -651,12 +703,36 @@ export function useWebRTC(): UseWebRTCResult {
         };
       }) => {
         if (payload.to !== selfId || payload.from === selfId) return;
-        const entry = peersRef.current.get(payload.from);
+        const entry =
+          peersRef.current.get(payload.from) ??
+          (() => {
+            const media = localStreamRef.current;
+            return media
+              ? createPeerFor(payload.from, media)
+              : null;
+          })();
+
         if (!entry) return;
+
         try {
-          await entry.pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
-        } catch {
-          /* benign — see comment in 1:1 version */
+          // Candidates are sometimes delivered before the corresponding
+          // offer/answer. Do not discard them; queue them until the
+          // remote description has been installed.
+          if (!entry.pc.remoteDescription) {
+            entry.pendingIceCandidates.push(payload.candidate);
+            return;
+          }
+
+          await entry.pc.addIceCandidate(
+            new RTCIceCandidate(payload.candidate)
+          );
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[zoom-mini] ICE candidate failed',
+            payload.from.slice(0, 6),
+            e
+          );
         }
       };
 
