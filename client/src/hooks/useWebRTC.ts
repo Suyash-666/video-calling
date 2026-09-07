@@ -966,10 +966,36 @@ export function useWebRTC(): UseWebRTCResult {
 
             return Array.from(map.values());
           });
+
+          // Reconcile the WebRTC mesh directly from the join payload.
+          // Do not wait for presenceState(): during the Realtime join race,
+          // it can still contain only our own presence.
+          const media = localStreamRef.current;
+          if (media) {
+            for (const row of joined) {
+              const peerId = row?.id;
+              if (!peerId || peerId === selfId) continue;
+
+              if (!peersRef.current.has(peerId)) {
+                createPeerFor(peerId, media);
+              }
+
+              if (selfId < peerId) {
+                const entry = peersRef.current.get(peerId);
+                if (
+                  entry &&
+                  (entry.pc.signalingState === 'stable' ||
+                    entry.pc.connectionState === 'failed' ||
+                    entry.pc.connectionState === 'closed')
+                ) {
+                  void callPeer(peerId);
+                }
+              }
+            }
+          }
         }
 
-        // Let Realtime finish its local presence-state update before the
-        // normal mesh reconciliation runs.
+        // Reconcile again after Realtime updates its local presence state.
         window.setTimeout(() => refreshPresence(), 0);
       });
 
