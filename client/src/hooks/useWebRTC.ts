@@ -369,6 +369,13 @@ export function useWebRTC(): UseWebRTCResult {
       pc.ontrack = (ev) => {
         const e = peersRef.current.get(peerId);
         if (!e) return;
+        console.log('[zoom-mini] REMOTE TRACK', peerId.slice(0, 6), {
+          kind: ev.track.kind,
+          id: ev.track.id,
+          readyState: ev.track.readyState,
+          enabled: ev.track.enabled,
+          streamCount: ev.streams.length,
+        });
         if (!e.remoteStream.getTracks().some((t) => t.id === ev.track.id)) {
           e.remoteStream.addTrack(ev.track);
         }
@@ -382,6 +389,13 @@ export function useWebRTC(): UseWebRTCResult {
 
       pc.onicecandidate = (ev) => {
         if (ev.candidate) {
+          console.log('[zoom-mini] LOCAL ICE CANDIDATE', peerId.slice(0, 6), {
+            candidate: ev.candidate.candidate,
+            protocol: ev.candidate.protocol,
+            type: ev.candidate.type,
+            address: ev.candidate.address,
+            port: ev.candidate.port,
+          });
           sendSignal('ice-candidate', peerId, {
             candidate: ev.candidate.toJSON(),
           });
@@ -436,6 +450,14 @@ export function useWebRTC(): UseWebRTCResult {
         }
       };
 
+      pc.onicecandidateerror = (ev) => {
+        console.warn('[zoom-mini] ICE CANDIDATE ERROR', peerId.slice(0, 6), {
+          url: ev.url,
+          errorCode: ev.errorCode,
+          errorText: ev.errorText,
+        });
+      };
+
       pc.onconnectionstatechange = () => {
         const e = peersRef.current.get(peerId);
         if (!e) return;
@@ -444,7 +466,12 @@ export function useWebRTC(): UseWebRTCResult {
         console.log(
           '[zoom-mini] connectionState',
           peerId.slice(0, 6),
-          pc.connectionState
+          pc.connectionState,
+          {
+            signalingState: pc.signalingState,
+            iceConnectionState: pc.iceConnectionState,
+            iceGatheringState: pc.iceGatheringState,
+          }
         );
         bumpPeerTick();
       };
